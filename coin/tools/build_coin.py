@@ -52,7 +52,8 @@ PREVIEW_RGB = {FIELD: (28, 28, 30), GUNMETAL: (62, 62, 66), INK: (10, 10, 10),
                COPPER: (214, 128, 84), GREEN: (140, 230, 40)}
 
 MOTTO = "FASTER RESPONSE WHEN SECONDS MATTER"
-FONT = "/usr/share/fonts/opentype/inter/Inter-Black.otf"
+FONT_DIR = "/usr/share/fonts/opentype/inter"
+FONT = f"{FONT_DIR}/Inter-Black.otf"            # set in main(): lighter weight for fine nozzles
 
 
 def hex_pts(r, cx=CX, cy=CY):
@@ -188,6 +189,24 @@ def reletter_motto(lab):
     return lab
 
 
+EYE_C, EYE_R = (1052, 647), 21          # eagle's eye in the rectified raster
+
+
+def redraw_eye(lab, min_px):
+    """The eye's concentric rings are finer than the colour separation resolves: redraw it as a
+    dark-rimmed green iris, dark pupil and a silver catch-light."""
+    yy, xx = np.mgrid[0:H, 0:W]
+    r = np.hypot(xx - EYE_C[0], yy - EYE_C[1])
+    lab = lab.copy()
+    rim = max(3.0, min_px * 0.6)
+    lab[r <= EYE_R + rim] = FIELD
+    lab[r <= EYE_R] = GREEN
+    lab[r <= max(9.0, min_px)] = FIELD
+    glint = max(3.0, min_px / 2)
+    lab[np.hypot(xx - (EYE_C[0] - 2), yy - (EYE_C[1] - 13)) <= glint] = SILVER
+    return lab
+
+
 # --- side B: re-letter the engraved phone numbers on the X ------------------------------------
 # (text, centre px, reading angle deg clockwise, cap height px, wipe box (along, across) px)
 NUMBERS = [("000", (1020, 435), -40.0, 36, (150, 56)),
@@ -264,7 +283,8 @@ def label_side(name, args):
     """Classified, cleaned label map for one face (unmirrored, as seen)."""
     mm_px = 2 * R_PX / args.size                            # raster pixels per mm
     min_px = args.min_feature * mm_px
-    lab = classify(rectify(name))
+    src = rectify(name)
+    lab = classify(src)
 
     # smooth class boundaries (Gaussian-weighted majority vote) so metal texture does not leave
     # ragged edges, then drop specks below the printable minimum
@@ -272,13 +292,34 @@ def label_side(name, args):
     for cls in (SILVER, COPPER, GREEN, FIELD):
         lab = drop_specks(lab, cls, min_px ** 2, None)
 
-    # a flat face has no relief to show the darker metal, so gunmetal feathers print as silver
-    # (the dark outlines around each feather keep the facets distinct); small gunmetal specks
-    # are background texture and go dark
-    n, cc, st, _ = cv2.connectedComponentsWithStats((lab == GUNMETAL).astype(np.uint8), connectivity=4)
-    big = np.isin(cc, np.where(st[:, cv2.CC_STAT_AREA] >= (1.2 * mm_px) ** 2)[0][1:])
-    lab[(lab == GUNMETAL) & big] = SILVER
+    # recover the dark outlines between facets: the render shades them as narrow grooves that
+    # colour thresholds miss, so find narrow dark features with a black-top-hat filter
+    grey = cv2.cvtColor(cv2.bilateralFilter(src, 7, 30, 5), cv2.COLOR_RGB2GRAY)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    lines = (cv2.morphologyEx(grey, cv2.MORPH_BLACKHAT, k) > 30) & (grey < 130)
+    n, cc, st, _ = cv2.connectedComponentsWithStats(lines.astype(np.uint8), connectivity=8)
+    lines &= np.isin(cc, np.where(st[:, cv2.CC_STAT_AREA] >= 3 * min_px ** 2)[0][1:])
+    lab[lines & np.isin(lab, (SILVER, GUNMETAL, COPPER))] = FIELD
+
+    # dark "gunmetal" feathers are only ~15 grey levels above the background, so find them as
+    # metal (heavily smoothed brightness) that is neither silver, copper, green nor an outline
+    v = cv2.cvtColor(src, cv2.COLOR_RGB2HSV)[..., 2].astype(np.float32)
+    metal = cv2.GaussianBlur(v, (0, 0), 4) > 64
+    gm = metal & np.isin(lab, (FIELD, GUNMETAL)) & ~lines
+    gm = cv2.morphologyEx(gm.astype(np.uint8), cv2.MORPH_OPEN,
+                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))).astype(bool)
+    n, cc, st, _ = cv2.connectedComponentsWithStats(gm.astype(np.uint8), connectivity=4)
+    gm = np.isin(cc, np.where(st[:, cv2.CC_STAT_AREA] >= (1.0 * mm_px) ** 2)[0][1:])
     lab[lab == GUNMETAL] = FIELD
+    if args.gunmetal == "silver":
+        lab[gm] = SILVER
+    else:
+        # a flat face cannot show a second metal tone: print the feather dark with a silver
+        # edge, as the render's bevel highlight reads
+        ring_px = max(min_px, 0.3 * mm_px)
+        core = cv2.erode(gm.astype(np.uint8), cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (int(2 * ring_px) | 1, int(2 * ring_px) | 1))).astype(bool)
+        lab[gm & ~core] = SILVER
 
     # widen hairlines to the printable minimum: isolated light strokes first, then the dark
     # outlines between facets (dark wins, so facets stay separated)
@@ -293,6 +334,7 @@ def label_side(name, args):
     # lettering is redrawn from a font last so nothing above erodes it
     if name == "side_a_eagle":
         lab = reletter_motto(lab)
+        lab = redraw_eye(lab, min_px)
     else:
         # copper on this face is lettering only; other copper pixels are bronze reflections on
         # the silver radar lines in the render
@@ -313,6 +355,9 @@ def label_side(name, args):
     for c, rgb in PREVIEW_RGB.items():
         prev[lab == c] = rgb
     Image.fromarray(prev).save(os.path.join(args.out, f"{name}_face.png"))
+    cmp_ = np.full((H, 2 * W + 20, 3), 255, np.uint8)
+    cmp_[:, :W], cmp_[:, W + 20:] = src, prev
+    Image.fromarray(cmp_).resize((W + 10, H // 2)).save(os.path.join(args.out, f"compare_{name}.png"))
     return lab
 
 
@@ -394,9 +439,14 @@ def main():
     ap.add_argument("--rim", type=float, default=1.8, help="rim width, mm")
     ap.add_argument("--min-feature", type=float, default=0.38,
                     help="thinnest printable stroke, mm (0.38 for a 0.4 nozzle, 0.22 for 0.2)")
-    ap.add_argument("--out", default=os.path.join(ROOT, "stl"))
+    ap.add_argument("--gunmetal", choices=("silver", "outline"), default="silver",
+                    help="dark feathers: solid silver, or dark with a silver edge")
+    ap.add_argument("--out", default=os.path.join(ROOT, "stl", "nozzle_0.4"))
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
+    global FONT
+    # a fine nozzle can hold the source's lighter letter weight; a 0.4 needs the heavier one
+    FONT = f"{FONT_DIR}/Inter-{'ExtraBold' if args.min_feature < 0.3 else 'Black'}.otf"
 
     lab_a = label_side("side_a_eagle", args)
     lab_b = label_side("side_b_dfrx", args)

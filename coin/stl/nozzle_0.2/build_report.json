@@ -2,67 +2,67 @@
 {
   "coin_one_piece": {
     "dark": {
-      "triangles": 41602,
-      "volume_mm3": 6898.4,
+      "triangles": 45308,
+      "volume_mm3": 6896.8,
       "watertight": true
     },
     "silver": {
-      "triangles": 34390,
-      "volume_mm3": 884.5,
+      "triangles": 38814,
+      "volume_mm3": 891.6,
       "watertight": true
     },
     "copper": {
-      "triangles": 7712,
-      "volume_mm3": 102.0,
+      "triangles": 7524,
+      "volume_mm3": 100.0,
       "watertight": true
     },
     "green": {
-      "triangles": 3848,
-      "volume_mm3": 40.4,
+      "triangles": 4256,
+      "volume_mm3": 37.2,
       "watertight": true
     }
   },
   "half_a_eagle": {
     "dark": {
-      "triangles": 26366,
-      "volume_mm3": 3424.2,
+      "triangles": 28426,
+      "volume_mm3": 3414.1,
       "watertight": true
     },
     "silver": {
-      "triangles": 21646,
-      "volume_mm3": 445.3,
+      "triangles": 23854,
+      "volume_mm3": 455.8,
       "watertight": true
     },
     "copper": {
-      "triangles": 3900,
+      "triangles": 4204,
       "volume_mm3": 74.6,
       "watertight": true
     },
     "green": {
-      "triangles": 2168,
-      "volume_mm3": 18.8,
+      "triangles": 2116,
+      "volume_mm3": 18.6,
       "watertight": true
     }
   },
   "half_b_dfrx": {
     "dark": {
-      "triangles": 15260,
-      "volume_mm3": 3474.2,
+      "triangles": 16906,
+      "volume_mm3": 3482.7,
       "watertight": true
     },
     "silver": {
-      "triangles": 12742,
-      "volume_mm3": 439.2,
+      "triangles": 14958,
+      "volume_mm3": 435.8,
       "watertight": true
     },
     "copper": {
-      "triangles": 3812,
-      "volume_mm3": 27.3,
+      "triangles": 3320,
+      "volume_mm3": 25.4,
       "watertight": true
     },
     "green": {
-      "triangles": 1680,
-      "volume_mm3": 21.6,
+      "triangles": 2140,
+      "volume_mm3": 18.5,
       "watertight": true
     }
   },
@@ -72,6 +72,7 @@
     "inlay": 0.6,
     "chamfer": 0.4,
     "rim": 1.8,
-    "min_feature": 0.38
+    "min_feature": 0.22,
+    "gunmetal": "silver"
   }
 }

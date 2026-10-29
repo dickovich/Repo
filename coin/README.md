@@ -3,12 +3,16 @@
 A two-sided, 60 mm hexagonal challenge coin made from the two supplied renders. Both faces are
 **flat colour inlays**: every colour sits level, and the detail comes from colour only.
 
-| Face | Source | Print face | Before / after |
-|---|---|---|---|
-| A: eagle / "Faster response when seconds matter" | `src/side_a_eagle.png` | `stl/side_a_eagle_face.png` | `stl/compare_side_a_eagle.png` |
-| B: dFRX / "Drone as first responder" | `src/side_b_dfrx.png` | `stl/side_b_dfrx_face.png` | `stl/compare_side_b_dfrx.png` |
+Two builds are provided, one per nozzle size. Use the folder that matches your nozzle:
 
-## Files (`stl/`)
+| Folder | Nozzle | Finest line | Lettering weight |
+|---|---|---|---|
+| `stl/nozzle_0.2/` | 0.2 mm | 0.22 mm | Inter ExtraBold (closer to the render) |
+| `stl/nozzle_0.4/` | 0.4 mm | 0.38 mm | Inter Black |
+
+Each folder has `side_*_face.png` (the face as it will print) and `compare_side_*.png` (source on the left, print on the right).
+
+## Files (in each `stl/nozzle_*/` folder)
 
 Each set has one STL per filament, all on the same origin, plus a `_4colour.3mf` containing all four.
 
@@ -29,16 +33,17 @@ Each set has one STL per filament, all on the same origin, plus a `_4colour.3mf`
 
 - **Size:** hexagon 60 mm across corners (52 mm across flats), 3.4 mm thick, with a 0.4 mm 45° chamfer on both face edges.
 - **Inlay:** colours are 0.6 mm deep on each face, which is enough for light colours to be opaque over black.
-- **Detail limit:** nothing is narrower than 0.38 mm, the narrowest line a 0.4 mm nozzle reliably prints. Finer source detail is either widened to 0.38 mm or dropped.
+- **Detail limit:** nothing is narrower than the folder's finest line (0.22 mm or 0.38 mm), so the slicer won't drop it. Finer source detail is either widened to that width or dropped.
 - **Mesh check:** every STL is a closed (watertight) mesh, and the colour bodies don't overlap (boundary overlap under 0.002 mm).
 
-## Printing (Bambu Studio / OrcaSlicer, 0.4 mm nozzle)
+## Printing (Bambu Studio / OrcaSlicer)
 
 1. Import the four `coin_one_piece_*.stl` files together, or the 3MF. When asked, choose **"load as a single object with multiple parts"**. Then assign the dark, silver, copper and green filaments.
 2. Keep each colour as a separate part; don't use paint-on colour. Separate parts keep all four colours on the same layers.
 3. Suggested settings:
-   - **0.1 mm layers**, at least through the bottom and top 0.6 mm. Variable layer height can use 0.2 mm in the dark core.
-   - First-layer line width about 0.3 mm.
+   - **0.4 mm nozzle:** 0.1 mm layers, at least through the bottom and top 0.6 mm. Variable layer height can use 0.2 mm in the dark core. First-layer line width about 0.3 mm.
+   - **0.2 mm nozzle:** 0.06–0.08 mm layers through the inlays. First-layer line width about 0.22 mm. Expect a long print, roughly 2–3 times the 0.4 mm time.
+   - With a 0.2 mm nozzle, a small, intricate first layer is less forgiving: level the bed or run calibration, and slow the first layer down.
    - Arachne wall generator.
    - **Ironing on the top surface**, for the dFRX face.
    - Prime tower or "flush into infill" on.
@@ -50,7 +55,9 @@ Each set has one STL per filament, all on the same origin, plus a `_4colour.3mf`
 - **Motto spelling fixed.** The source render reads "SECON**O**S". The lettering is redrawn from a font (Inter Black) so it reads **"SECONDS"**.
 - **000 / 131444 redrawn** from a font for clean edges.
 - **Rim redrawn** as a clean hexagon.
-- **Two metal tones become one.** A flat face can't show the render's gunmetal tone. Gunmetal feathers print silver, and the dark outlines around each feather keep the facets distinct.
+- **Two metal tones become one.** A flat face can't show the render's gunmetal tone, so the dark feathers print silver. They're found by heavily smoothed brightness, because they're only about 15 grey levels above the background. The dark outlines around each feather keep the facets distinct. `--gunmetal outline` prints them dark with a silver edge instead.
+- **Facet outlines recovered.** The render draws the outlines between facets as shaded grooves, which colour alone misses. A black-top-hat filter finds them so they print as dark lines.
+- **Eye redrawn** as a dark-rimmed green iris with a dark pupil and a silver catch-light. Its concentric rings are finer than the colour separation can resolve.
 - **Bronze reflections removed.** Copper-coloured reflections on side B's radar lines print silver; copper on that face is lettering only.
 - **No lighting effects.** The render's shading, gloss and glow can't be printed; each colour region is a single flat colour.
 
@@ -58,8 +65,9 @@ Each set has one STL per filament, all on the same origin, plus a `_4colour.3mf`
 
 ```bash
 pip install -r requirements.txt
-python3 tools/build_coin.py --size 60 --thickness 3.4 --inlay 0.6 --min-feature 0.38
-python3 tools/render_preview.py        # refreshes stl/render_*.png
+python3 tools/build_coin.py --min-feature 0.22 --out stl/nozzle_0.2   # 0.2 mm nozzle
+python3 tools/build_coin.py --min-feature 0.38 --out stl/nozzle_0.4   # 0.4 mm nozzle
+python3 tools/render_preview.py stl/nozzle_0.2                         # refreshes render_*.png
 ```
 
-Use `--min-feature 0.22` if you print with a 0.2 mm nozzle; more fine detail survives.
+Other options: `--size`, `--thickness`, `--inlay`, `--chamfer`, `--rim`, `--gunmetal`.

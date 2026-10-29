@@ -72,7 +72,7 @@ def render(stl_dir, stem, out, px_per_mm=20, tilt_deg=25, z_exag=1.0, from_below
 
 
 if __name__ == "__main__":
-    stl_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "stl")
+    stl_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "stl", "nozzle_0.4")
     render(stl_dir, "coin_one_piece", os.path.join(stl_dir, "render_side_b_top.png"))
     render(stl_dir, "coin_one_piece", os.path.join(stl_dir, "render_side_a_bottom.png"),
            from_below=True)
