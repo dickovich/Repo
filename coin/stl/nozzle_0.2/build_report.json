@@ -1,57 +1,57 @@
 {
   "coin_one_piece": {
     "black": {
-      "triangles": 56796,
-      "volume_mm3": 6792.1,
+      "triangles": 57052,
+      "volume_mm3": 6744.5,
       "watertight": true
     },
     "grey": {
-      "triangles": 47714,
-      "volume_mm3": 996.4,
+      "triangles": 49522,
+      "volume_mm3": 1036.8,
       "watertight": true
     },
     "copper": {
-      "triangles": 7376,
-      "volume_mm3": 93.8,
+      "triangles": 7640,
+      "volume_mm3": 100.3,
       "watertight": true
     },
     "green": {
-      "triangles": 5136,
-      "volume_mm3": 44.5,
+      "triangles": 4136,
+      "volume_mm3": 45.5,
       "watertight": true
     }
   },
   "half_a_eagle": {
     "black": {
-      "triangles": 33194,
-      "volume_mm3": 3340.2,
+      "triangles": 34068,
+      "volume_mm3": 3301.2,
       "watertight": true
     },
     "grey": {
-      "triangles": 28168,
-      "volume_mm3": 531.0,
+      "triangles": 29556,
+      "volume_mm3": 563.0,
       "watertight": true
     },
     "copper": {
-      "triangles": 4056,
-      "volume_mm3": 71.7,
+      "triangles": 4320,
+      "volume_mm3": 78.2,
       "watertight": true
     },
     "green": {
-      "triangles": 2384,
-      "volume_mm3": 20.7,
+      "triangles": 2564,
+      "volume_mm3": 21.2,
       "watertight": true
     }
   },
   "half_b_dfrx": {
     "black": {
-      "triangles": 23622,
-      "volume_mm3": 3451.9,
+      "triangles": 23004,
+      "volume_mm3": 3443.3,
       "watertight": true
     },
     "grey": {
-      "triangles": 19536,
-      "volume_mm3": 465.4,
+      "triangles": 19956,
+      "volume_mm3": 473.8,
       "watertight": true
     },
     "copper": {
@@ -60,8 +60,8 @@
       "watertight": true
     },
     "green": {
-      "triangles": 2752,
-      "volume_mm3": 23.8,
+      "triangles": 1572,
+      "volume_mm3": 24.3,
       "watertight": true
     }
   },

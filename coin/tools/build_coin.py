@@ -3,8 +3,9 @@
 Pipeline per side:
   1. Rectify the (slightly perspective) render onto a regular flat-top hexagon.
   2. Flatten the render with L0 gradient smoothing (texture and lighting noise go, facet edges
-     stay sharp), then classify each pixel by CIELAB lightness/hue: field, gunmetal, silver,
-     copper, green. Side A: recover the darkest feathers by context (enclosed compact regions).
+     stay sharp), then segment it into facets (one region per plate, letter or panel; see
+     facets.py) and give each facet one material: black, grey, copper or green. Thin facets
+     (bevel highlights, reflections) take the material of the plate they frame.
   3. Keep the render's own lettering (lettering zones get only fine clean-up) and correct the
      "SECONOS" typo by turning the misspelt O into a D in the same typeface; draw side B's gem
      and crosshair as exact geometry; dark-metal feathers become fine grey hatching.
@@ -29,7 +30,8 @@ import trimesh
 from PIL import Image
 from skimage.morphology import skeletonize
 
-from lines import smooth_lines
+from lines import smooth_lines, radar_redraw
+import facets
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -96,38 +98,6 @@ def classify(flat):
     return out
 
 
-def find_dark_feathers(src, flat, mm_px):
-    """Darkest gunmetal feathers flatten to the same lightness as the background (L ~56), so
-    find them by context: compact regions enclosed by grooves and bevel highlights, lying on
-    the eagle, away from the outer frame. Long thin arcs (the dial ring) fail the solidity test."""
-    lab = cv2.cvtColor(flat, cv2.COLOR_RGB2LAB).astype(np.int16)
-    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
-    v = cv2.cvtColor(src, cv2.COLOR_RGB2HSV)[..., 2].astype(np.float32)
-    eagle = cv2.GaussianBlur(v, (0, 0), 4) > 64
-    bound = (L < 38) | (L >= 125) | ((a >= 140) & (b >= 143)) | ((a <= 124) & (b >= 146))
-    bound = cv2.dilate(bound.astype(np.uint8), np.ones((3, 3), np.uint8))
-    n, cc, st, cen = cv2.connectedComponentsWithStats(1 - bound, connectivity=4)
-    edge_dist = cv2.distanceTransform(hex_mask(R_PX).astype(np.uint8), cv2.DIST_L2, 5)
-    keep = []
-    for i in range(1, n):
-        area = st[i, cv2.CC_STAT_AREA]
-        if not 0.3 <= area / mm_px ** 2 <= 40:
-            continue
-        x, y, w, h = st[i, :4]
-        m = cc[y:y + h, x:x + w] == i
-        if eagle[y:y + h, x:x + w][m].mean() < 0.5:
-            continue
-        pts = np.c_[np.nonzero(m)[1] + x, np.nonzero(m)[0] + y].astype(np.int32)
-        solidity = area / max(cv2.contourArea(cv2.convexHull(pts)), 1)
-        length = max(cv2.minAreaRect(pts)[1]) / mm_px
-        if solidity >= 0.7 and length <= 24 and edge_dist[int(cen[i][1]), int(cen[i][0])] >= 4.5 * mm_px:
-            keep.append(i)
-    feathers = np.isin(cc, keep)
-    # regrow by the sealing dilation so the feather meets its groove/highlight
-    grown = cv2.dilate(feathers.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
-    return grown & (L < 125)
-
-
 def eagle_mask(src, mm_px=2 * R_PX / 60, close_mm=3.0):
     """The eagle's silhouette: bright metal (heavily smoothed brightness) away from the rim, frame
     and motto band, largest region, closed so the dark feathers between bright ones are inside."""
@@ -152,70 +122,63 @@ def eagle_mask(src, mm_px=2 * R_PX / 60, close_mm=3.0):
     return (m > 0) | holes
 
 
-def block_fill(lab, flat, dark_feathers, eagle, mm_px, groove_l=30, max_area_mm2=45):
-    """Solid colour per panel. The render's panels are separated by deep black grooves; inside a
-    panel the colour varies only through lighting (bevel highlights, shading). Label each
-    groove-bounded panel and fill it with one colour from what it mostly contains, so highlight
-    strips and shading disappear and every panel keeps its full outline. Large regions (dial
-    background, motto band, rim, frame) keep their per-pixel classes."""
-    L = cv2.cvtColor(flat, cv2.COLOR_RGB2LAB)[..., 0]
-    # grooves: deep black, or narrow lines clearly darker than both sides (shallow grooves
-    # between neighbouring copper feathers)
-    bh = cv2.morphologyEx(L, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
-    groove = (L < groove_l) | ((bh > 35) & (L < 80))
-    sealed = cv2.dilate(groove.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
-    n, cc, st, _ = cv2.connectedComponentsWithStats((~sealed).astype(np.uint8), connectivity=4)
-    idx = cc.ravel()
-    count = np.bincount(idx, minlength=n).astype(float)
-    frac = {c: np.bincount(idx, weights=(lab.ravel() == c), minlength=n) / np.maximum(count, 1)
-            for c in (FIELD, SILVER, COPPER, GREEN, GUNMETAL)}
-    mean_l = np.bincount(idx, weights=L.ravel().astype(float), minlength=n) / np.maximum(count, 1)
-    feather = np.bincount(idx, weights=dark_feathers.ravel(), minlength=n) / np.maximum(count, 1)
-    on_eagle = np.bincount(idx, weights=eagle.ravel(), minlength=n) / np.maximum(count, 1)
-    colour = np.full(n, 255, np.uint8)                      # 255 = keep per-pixel classes
-    small = (st[:, cv2.CC_STAT_AREA] <= max_area_mm2 * mm_px ** 2)
-    small[0] = False
-    metal = frac[SILVER] + frac[GUNMETAL]
-    # fill a panel only when one material clearly dominates it; a region that mixes materials
-    # is several panels joined through breaks in the groove, and is resolved per sub-panel below
-    for i in np.nonzero(small)[0]:
-        cop, grn, sil = frac[COPPER][i], frac[GREEN][i], frac[SILVER][i]
-        dark = frac[GUNMETAL][i] + frac[FIELD][i]
-        if cop >= 0.65:
-            colour[i] = COPPER
-        elif grn >= 0.65:
-            colour[i] = GREEN
-        elif cop + grn <= 0.12:
-            if feather[i] < 0.5 and frac[FIELD][i] >= 0.6 and (on_eagle[i] < 0.6 or mean_l[i] < 40):
-                colour[i] = FIELD                           # background showing between parts
-            elif sil >= 0.8 * (sil + dark):
-                colour[i] = SILVER
-            elif sil <= 0.2 * (sil + dark) or feather[i] >= 0.5 or on_eagle[i] >= 0.6:
-                colour[i] = GUNMETAL                        # dark-metal panel
-    fill = colour[cc]
-    out = np.where(fill != 255, fill, lab).astype(np.uint8)
-    # dark panels on the eagle that join the background through a break in their groove are
-    # part of a large region: inside the eagle's outline, dark non-groove pixels are dark metal
-    inner = cv2.erode(eagle.astype(np.uint8), np.ones((int(0.5 * mm_px) | 1,) * 2, np.uint8)).astype(bool)
-    out[(fill == 255) & (cc > 0) & inner & (lab == FIELD) & (L >= 40)] = GUNMETAL
-    # mixed regions: one material per sub-panel, smoothed so each is a clean block
-    mixed = small[cc] & (fill == 255)
-    sub = np.where(np.isin(lab, (FIELD, GUNMETAL)), GUNMETAL, lab).astype(np.uint8)
-    sub = majority(sub, 5, [SILVER, COPPER, GREEN, GUNMETAL])
-    out[mixed] = sub[mixed]
-    # in mixed regions, thin grey strips along copper/green are bevel highlights: absorb them
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(0.35 * mm_px) | 1,) * 2)
-    grey = (out == SILVER) & (fill == 255)
-    thin = grey & ~cv2.morphologyEx(grey.astype(np.uint8), cv2.MORPH_OPEN, k).astype(bool)
-    for c in (COPPER, GREEN):
-        near = cv2.dilate((out == c).astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
-        out[thin & near] = c
-    out[groove] = FIELD
-    # the seal ring (one pixel inside each panel edge) takes its panel's colour again
-    ring = sealed & ~groove
-    for c in (SILVER, COPPER, GREEN):
-        grown = cv2.dilate((fill == c).astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
-        out[ring & grown] = c
+def fill_notches(lab, classes, mm_px, max_depth_mm=0.9, min_ratio=2.5, min_area_mm2=1.5,
+                 keep=None):
+    """Fill shallow dents in a panel's outline (left by shading or highlights along its edge):
+    convexity defects no deeper than max_depth_mm and at least min_ratio times wider than
+    deep. Real slots and gaps are deep or narrow and are kept. Fills only into black."""
+    out = lab.copy()
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(0.6 * mm_px) | 1,) * 2)
+    inner = hex_mask(R_PX - 2.6 * mm_px * 2 / np.sqrt(3)).astype(np.uint8)   # rim excluded
+    for c in classes:
+        # panels only: thin lines touching a panel would join it to other panels
+        m = cv2.morphologyEx((lab == c).astype(np.uint8) & inner, cv2.MORPH_OPEN, k)
+        cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        fill = np.zeros_like(m)
+        for cnt in cs:
+            if cv2.contourArea(cnt) < min_area_mm2 * mm_px ** 2 or len(cnt) < 8:
+                continue
+            hull = cv2.convexHull(cnt, returnPoints=False)
+            try:
+                defects = cv2.convexityDefects(cnt, hull)
+            except cv2.error:
+                continue
+            if defects is None:
+                continue
+            for s0, e0, f0, d in defects.reshape(-1, 4):
+                depth = d / 256.0
+                span = np.hypot(*(cnt[s0, 0] - cnt[e0, 0]).astype(float))
+                if depth < 1.0 or depth > max_depth_mm * mm_px or span < min_ratio * depth:
+                    continue
+                seg = cnt[s0:e0 + 1, 0] if s0 <= e0 else np.r_[cnt[s0:, 0], cnt[:e0 + 1, 0]]
+                cv2.fillPoly(fill, [seg.reshape(-1, 1, 2)], 1)
+        grow = (fill > 0) & (out == FIELD)
+        if keep is not None:
+            grow &= ~keep
+        out[grow] = c
+    return out
+
+
+def straighten_large(lab, keep, mm_px, min_area_mm2=12, smooth_mm=0.5, eps_mm=0.18):
+    """Large grey shapes (letters, X arms): smooth away notches and spikes under smooth_mm and
+    redraw as polygons with eps_mm tolerance. They may only grow into black."""
+    big = np.zeros_like(lab, bool)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(0.6 * mm_px) | 1,) * 2)
+    inner = hex_mask(R_PX - 2.6 * mm_px * 2 / np.sqrt(3)).astype(np.uint8)   # rim excluded
+    m = cv2.morphologyEx((lab == SILVER).astype(np.uint8) & inner, cv2.MORPH_OPEN, k)
+    n, cc, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    for i in range(1, n):
+        if st[i, cv2.CC_STAT_AREA] >= min_area_mm2 * mm_px ** 2:
+            big |= cc == i
+    if not big.any():
+        return lab
+    sub = np.where(big, SILVER, np.where(lab == SILVER, FIELD, lab)).astype(np.uint8)
+    sm = straighten(np.where(big, SILVER, FIELD).astype(np.uint8), eps_mm * mm_px, smooth_mm * mm_px)
+    grown = (sm == SILVER) & ((lab == FIELD) | big) & ~keep
+    shrunk = big & (sm != SILVER) & ~keep
+    out = lab.copy()
+    out[shrunk] = FIELD
+    out[grown] = SILVER
     return out
 
 
@@ -266,6 +229,42 @@ def straighten(lab, eps_px, smooth_px=0):
         out[(canvas > 0) | ((m > 0) & (cv2.erode(m, np.ones((3, 3), np.uint8)) == 0)
                            & (cv2.dilate(canvas, np.ones((3, 3), np.uint8)) == 0))] = c
     return out
+
+
+def facet_labels(name, src, flat, raw, mm_px):
+    """One material per facet: segment the flattened render into plates/letters/panels
+    (facets.segment), decide each region's material, then let thin regions (bevel highlights,
+    reflections) take the material of the plate they border."""
+    reg, rmat, meanL = facets.segment(flat, raw, {"copper": COPPER, "green": GREEN})
+    m = reg.max() + 1
+    cnt = np.bincount(reg.ravel(), minlength=m).astype(float)
+    if name == "side_a_eagle":
+        on = np.bincount(reg.ravel(), weights=eagle_mask(src).ravel(), minlength=m) / cnt >= 0.5
+    else:
+        on = np.zeros(m, bool)
+    cls = np.full(m, FIELD, np.uint8)
+    cls[rmat == facets.GREEN_M] = GREEN
+    cls[rmat == facets.COPPER_M] = COPPER
+    metal = rmat == facets.METAL
+    cls[metal & (meanL >= 100)] = SILVER                    # bright metal
+    cls[metal & (meanL < 100) & on] = GUNMETAL              # dark metal plates on the eagle
+    cls[metal & (meanL < 100) & ~on & (meanL >= 75)] = SILVER   # dim stretches of line-work
+    cls = facets.absorb_thin(reg, cls, mm_px, dark=FIELD, keep=(GREEN,),
+                             prefer=(GREEN, COPPER) if name == "side_a_eagle" else ())
+    lab = cls[reg]
+    if name == "side_a_eagle":
+        # plate edges: where two metal plates meet along a groove in the render (even a faint
+        # one), keep a black line between them, so plates stay distinct once all metal is grey
+        L = cv2.cvtColor(flat, cv2.COLOR_RGB2LAB)[..., 0]
+        bh = cv2.morphologyEx(L, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+        edge = np.zeros(reg.shape, bool)
+        edge[:, 1:] |= reg[:, 1:] != reg[:, :-1]
+        edge[1:, :] |= reg[1:, :] != reg[:-1, :]
+        metal = np.isin(lab, (SILVER, GUNMETAL))
+        metal_nb = cv2.erode(metal.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool) | metal
+        groove = (cv2.dilate(bh, np.ones((3, 3), np.uint8)) >= 14) & (L < 120)
+        lab[edge & metal_nb & groove & eagle_mask(src)] = FIELD
+    return lab
 
 
 def hatch_gunmetal(lab, line_px, pitch_px):
@@ -349,7 +348,36 @@ def band_mask(rin, rout, a0, a1, pad=0):
     return (ang >= a0) & (ang <= a1) & (rad >= rin(ang) + pad) & (rad <= rout(ang) - pad)
 
 
+EYE_C, EYE_R = (1052, 647), 36           # the eye: centre and radius of its traced zone, px
 EYE_LID = ((1063, 623), (1099, 668), 5.0)   # lid-line segment under the brow (px), half-width
+
+
+IRIS_C, IRIS_R = (1050, 648), 24        # the iris: concentric rings round this centre, px
+
+
+def iris_zone():
+    yy, xx = np.mgrid[0:H, 0:W]
+    return np.hypot(xx - IRIS_C[0], yy - IRIS_C[1]) <= IRIS_R
+
+
+def smooth_iris(lab, size=96):
+    """Smooth the iris in polar coordinates round its centre: each ring (outer green ring, dark
+    ring, C-shaped inner ring, pupil) becomes a clean band with smooth edges, its gaps kept."""
+    classes = (FIELD, SILVER, GREEN)
+    c = (float(IRIS_C[0]), float(IRIS_C[1]))
+    dsize = (size, 720)                                     # radius bins x angle bins (0.5 deg)
+    votes = []
+    for k in classes:
+        m = (lab == k).astype(np.float32)
+        pol = cv2.warpPolar(m, dsize, c, IRIS_R + 4, cv2.WARP_POLAR_LINEAR)
+        pol = cv2.blur(pol, (9, 41))                        # ~2.5 px radially, ~20 deg round
+        votes.append(cv2.warpPolar(pol, (W, H), c, IRIS_R + 4,
+                                   cv2.WARP_POLAR_LINEAR | cv2.WARP_INVERSE_MAP))
+    best = np.asarray(classes, np.uint8)[np.argmax(np.stack(votes), 0)]
+    out = lab.copy()
+    z = iris_zone()
+    out[z] = best[z]
+    return out
 
 
 def eye_lid_line(flat):
@@ -485,6 +513,85 @@ def _debug(lab, name, tag):
         Image.fromarray(prev).save(os.path.join(d, f"{name}_{tag}.png"))
 
 
+TALONS = [(860, 905), (1000, 840), (1130, 900), (1130, 1075), (860, 1075)]   # side A, px
+
+RADAR_C = (678, 564)                    # side B: centre of the radar rings (fitted), px
+
+
+def redraw_side_b_lines(lab, raw, mm_px, min_px):
+    """Side B's line-work drawn exactly: radar rings as true arcs with their ticks, straight
+    strokes (spokes, frame lines, green glow strips) as straight segments; specks dropped."""
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(0.6 * mm_px) | 1,) * 2)
+    face = hex_mask(R_PX - 3.5 * mm_px * 2 / np.sqrt(3))   # inside the rim
+    zones = traced_zones("side_b_dfrx", mm_px)
+    zones[:, CROSSHAIR_X - 8:CROSSHAIR_X + 9] = True        # crosshair is drawn exactly later
+    out = lab.copy()
+    for c in (SILVER, GREEN):
+        m = (lab == c).astype(np.uint8)
+        thick = cv2.morphologyEx(m, cv2.MORPH_OPEN, k)
+        near_thick = cv2.dilate(thick, np.ones((5, 5), np.uint8)).astype(bool)
+        thin = (m > 0) & ~near_thick & ~zones & face
+        if c == SILVER:
+            excl = cv2.dilate(thick, np.ones((9, 9), np.uint8)).astype(bool) | zones | ~face
+            rawg = np.isin(raw, (SILVER, GUNMETAL)) & ~excl
+            new = radar_redraw(rawg, thin, RADAR_C, mm_px, min_px, bright=(raw == SILVER) & ~excl)
+        else:
+            # the green glow strips in the letters' slots: straight segments, specks dropped
+            new = radar_redraw(np.zeros_like(thin), thin, RADAR_C, mm_px, min_px)
+        new &= face & ~zones & ~near_thick
+        out[thin] = FIELD
+        out[new & (out == FIELD)] = c
+    return out
+
+
+def draw_gem(lab, min_px, mm_px):
+    """The X's centre is a square green gem: an exact quadrilateral in a clean dark setting."""
+    lab = lab.copy()
+    # the X's centre is a square green gem: replace the traced blob with an exact quadrilateral
+    gem = np.zeros_like(lab, np.uint8)
+    gem[GEM_BOX[1]:GEM_BOX[3], GEM_BOX[0]:GEM_BOX[2]] = lab[GEM_BOX[1]:GEM_BOX[3],
+                                                           GEM_BOX[0]:GEM_BOX[2]] == GREEN
+    n, cc, st, _ = cv2.connectedComponentsWithStats(gem, connectivity=8)
+    if n > 1:
+        big = 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
+        pts = np.c_[np.nonzero(cc == big)[1], np.nonzero(cc == big)[0]].astype(np.int32)
+        hull = cv2.convexHull(pts)
+        quad = cv2.approxPolyDP(hull, 0.04 * cv2.arcLength(hull, True), True)
+        if len(quad) != 4:
+            quad = np.int32(cv2.boxPoints(cv2.minAreaRect(pts)))
+        ring = np.zeros_like(gem)
+        cv2.fillPoly(ring, [quad.reshape(-1, 2)], 1)
+        # the gem's dark setting: a clean band round it (0.45 mm, as in the render)
+        band = int(max(min_px, 0.45 * mm_px)) | 1
+        grown = cv2.dilate(ring, cv2.getStructuringElement(cv2.MORPH_RECT, (band, band)))
+        lab[(grown > 0) & (ring == 0)] = FIELD
+        lab[(cc == big) & (ring == 0)] = FIELD
+        lab[ring > 0] = GREEN
+    return lab
+
+
+def exact_triangles(lab, cls, mm_px, min_area_mm2=0.8, fit=0.85):
+    """Regions that are triangles (the green markers) are redrawn as exact triangles."""
+    m = (lab == cls).astype(np.uint8)
+    n, cc, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    out = lab.copy()
+    for i in range(1, n):
+        if st[i, cv2.CC_STAT_AREA] < min_area_mm2 * mm_px ** 2:
+            continue
+        pts = np.c_[np.nonzero(cc == i)[1], np.nonzero(cc == i)[0]].astype(np.float32)
+        area, tri = cv2.minEnclosingTriangle(pts.reshape(-1, 1, 2))
+        if area <= 0 or st[i, cv2.CC_STAT_AREA] / area < fit:
+            continue
+        tri = tri.reshape(3, 2)
+        c = tri.mean(0)
+        tri = c + (tri - c) * np.sqrt(st[i, cv2.CC_STAT_AREA] / area)   # keep the area
+        out[(cc == i)] = FIELD
+        poly = np.zeros_like(m)
+        cv2.fillPoly(poly, [np.int32(np.round(tri * 8))], 1, cv2.LINE_8, shift=3)
+        out[poly > 0] = cls
+    return out
+
+
 def traced_zones(name, mm_px):
     """Areas that keep their traced curves instead of being polygonised: lettering, the eye,
     the engraved digits."""
@@ -520,15 +627,29 @@ def label_side(name, args):
     min_px = args.min_feature * mm_px
     src = rectify(name)
     flat = flatten(src)
-    lab = classify(flat)
-    raw = lab.copy()                                        # before clean-up, for small lettering
+    raw = classify(flat)                                    # per pixel, for small lettering
+    lab = facet_labels(name, src, flat, raw, mm_px)         # one material per facet
     if name == "side_a_eagle":
-        dark_feathers = find_dark_feathers(src, flat, mm_px)
-        lab[dark_feathers & (lab == FIELD)] = GUNMETAL
+        # the talons grip the dark outer ring: facets merge claw and ring there, so the claws
+        # are traced from brightness (polished metal, L >= 80) against the dark ring
+        L = cv2.cvtColor(flat, cv2.COLOR_RGB2LAB)[..., 0]
+        claws = (L >= 80).astype(np.uint8)
+        claws = cv2.morphologyEx(claws, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        claws = cv2.morphologyEx(claws, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)).astype(bool)
+        talons = np.zeros(lab.shape, np.uint8)
+        cv2.fillPoly(talons, [np.int32(TALONS)], 1)
+        talons = talons.astype(bool) & (lab != COPPER)
+        lab[talons] = np.where(claws[talons], SILVER, FIELD)
+        # the eye's rings are finer than the facets: trace it per pixel (as before), so the
+        # almond socket, C-shaped iris ring, pupil and crescent all stay
+        yy, xx = np.mgrid[0:H, 0:W]
+        eye = np.hypot(xx - EYE_C[0], yy - EYE_C[1]) <= EYE_R
+        traced = majority(raw, 3, [FIELD, SILVER, COPPER, GREEN, GUNMETAL])
+        traced[traced == GUNMETAL] = FIELD                  # dark rings and pupil
+        traced[eye & ~iris_zone()] = np.where(raw == GUNMETAL, SILVER, traced)[eye & ~iris_zone()]
+        lab[eye] = traced[eye]
+        lab = smooth_iris(lab)
         lab[eye_lid_line(flat)] = GREEN
-        if args.blocks:
-            # tight outline here: a looser one bridges into background panels behind the talons
-            lab = block_fill(lab, flat, dark_feathers, eagle_mask(src, close_mm=1.5), mm_px)
     lab = majority(lab, 3, [FIELD, SILVER, COPPER, GREEN, GUNMETAL])
     for cls in (SILVER, COPPER, GREEN, GUNMETAL, FIELD):
         lab = drop_specks(lab, cls, min_px ** 2, None)
@@ -537,13 +658,14 @@ def label_side(name, args):
     if name == "side_a_eagle":
         # thin grey strips along a dark, copper or green panel are that panel's bevel highlight
         # (lighting, not artwork): they take the panel's colour
+        # (dark-metal plates' highlights too: those plates also print grey)
         bird = eagle_mask(src)
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(0.4 * mm_px) | 1,) * 2)
-        grey = (lab == SILVER).astype(np.uint8)
-        thin = (grey > 0) & ~cv2.morphologyEx(grey, cv2.MORPH_OPEN, k).astype(bool) & bird
-        for c in (GUNMETAL, COPPER, GREEN):
+        metal = np.isin(lab, (SILVER, GUNMETAL)).astype(np.uint8)
+        thin = (metal > 0) & ~cv2.morphologyEx(metal, cv2.MORPH_OPEN, k).astype(bool) & bird
+        for c in (COPPER, GREEN):
             near = cv2.dilate((lab == c).astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
-            lab[thin & near & (lab == SILVER)] = c
+            lab[thin & near & np.isin(lab, (SILVER, GUNMETAL))] = c
 
     if name == "side_b_dfrx":
         # on this face the mid-grey pixels are the dimmer stretches of the silver radar lines
@@ -587,24 +709,22 @@ def label_side(name, args):
 
     # thin line-work (radar and dial rings, spokes, ticks) redrawn as smooth constant-width
     # strokes; on the eagle face only outside the eagle, whose feather points stay as traced
-    if args.smooth_lines:
-        if name == "side_b_dfrx":
-            scope = np.ones_like(lab, bool)
-        else:
-            # only the dial's tick ring under the motto band, kept 3 mm clear of the eagle so
-            # claw tips and feather points are not treated as lines
-            rin, rout = band_profile()
-            yy, xx = np.mgrid[0:H, 0:W]
-            ang = np.degrees(np.arctan2(yy - BAND_C[1], xx - BAND_C[0]))
-            rad = np.hypot(xx - BAND_C[0], yy - BAND_C[1])
-            ticks = (ang >= -135) & (ang <= 25) & (rad < rin(ang) - 2) & (rad > rin(ang) - 4.5 * mm_px)
-            scope = ticks & ~cv2.dilate(eagle_mask(src).astype(np.uint8),
-                                        np.ones((int(3 * mm_px) | 1,) * 2, np.uint8)).astype(bool)
-        for c in (SILVER,):                                 # green glow halos stay as traced
-            m = (lab == c) & scope
-            sm = smooth_lines(m, min_px, 0.6 * mm_px, sigma=3.0) & scope
-            lab[m & ~sm] = FIELD
-            lab[sm & (lab == FIELD)] = c
+    if args.smooth_lines and name == "side_b_dfrx":
+        lab = redraw_side_b_lines(lab, raw, mm_px, min_px)
+    elif args.smooth_lines:
+        # only the dial's tick ring under the motto band, kept 3 mm clear of the eagle so claw
+        # tips and feather points are not treated as lines
+        rin, rout = band_profile()
+        yy, xx = np.mgrid[0:H, 0:W]
+        ang = np.degrees(np.arctan2(yy - BAND_C[1], xx - BAND_C[0]))
+        rad = np.hypot(xx - BAND_C[0], yy - BAND_C[1])
+        ticks = (ang >= -135) & (ang <= 25) & (rad < rin(ang) - 2) & (rad > rin(ang) - 4.5 * mm_px)
+        scope = ticks & ~cv2.dilate(eagle_mask(src).astype(np.uint8),
+                                    np.ones((int(3 * mm_px) | 1,) * 2, np.uint8)).astype(bool)
+        m = (lab == SILVER) & scope
+        sm = smooth_lines(m, min_px, 0.6 * mm_px, sigma=3.0) & scope
+        lab[m & ~sm] = FIELD
+        lab[sm & (lab == FIELD)] = SILVER
 
     # lettering keeps the render's own letterforms: its counters and letter gaps (~0.28 mm) are
     # finer than a 0.4 nozzle's clean-up minimum, so lettering zones get only the fine clean-up
@@ -665,31 +785,22 @@ def label_side(name, args):
             lab[digit] = COPPER
         # the vertical crosshair is a glowing green bar whose near-white core reads as silver in
         # places: draw it as an exact straight bar
-        # the X's centre is a square green gem: replace the traced blob with an exact quadrilateral
-        gem = np.zeros_like(lab, np.uint8)
-        gem[GEM_BOX[1]:GEM_BOX[3], GEM_BOX[0]:GEM_BOX[2]] = lab[GEM_BOX[1]:GEM_BOX[3],
-                                                               GEM_BOX[0]:GEM_BOX[2]] == GREEN
-        n, cc, st, _ = cv2.connectedComponentsWithStats(gem, connectivity=8)
-        if n > 1:
-            big = 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
-            pts = np.c_[np.nonzero(cc == big)[1], np.nonzero(cc == big)[0]].astype(np.int32)
-            hull = cv2.convexHull(pts)
-            quad = cv2.approxPolyDP(hull, 0.04 * cv2.arcLength(hull, True), True)
-            if len(quad) != 4:
-                quad = np.int32(cv2.boxPoints(cv2.minAreaRect(pts)))
-            ring = np.zeros_like(gem)
-            cv2.fillPoly(ring, [quad.reshape(-1, 2)], 1)
-            grown = cv2.dilate(ring, np.ones((int(min_px) | 1, int(min_px) | 1), np.uint8))
-            lab[(grown > 0) & (ring == 0) & (lab != SILVER)] = FIELD     # dark setting round the gem
-            lab[(cc == big) & (ring == 0)] = FIELD
-            lab[ring > 0] = GREEN
+        lab = draw_gem(lab, min_px, mm_px)
         half = max(3.0, min_px / 2)
         for y0, y1 in CROSSHAIR_Y:
             lab[y0:y1, int(round(CROSSHAIR_X - half)):int(round(CROSSHAIR_X + half)) + 1] = GREEN
 
-    # final pass: straighten edges touched by the widening and the redraws above
+    # final pass: straighten edges touched by the widening and the redraws above; side B's
+    # letters and X arms are large plain shapes, so they get a stronger clean-up
     if args.straighten > 0:
-        lab = straighten_panels(lab, traced_zones(name, mm_px), mm_px, args.straighten)
+        zones = traced_zones(name, mm_px)
+        lab = fill_notches(lab, (SILVER, COPPER, GREEN), mm_px, keep=zones)
+        lab = straighten_panels(lab, zones, mm_px, args.straighten)
+        if name == "side_b_dfrx":
+            lab = straighten_large(lab, zones, mm_px)
+    if name == "side_b_dfrx":
+        lab = exact_triangles(lab, GREEN, mm_px)
+        lab = draw_gem(lab, min_px, mm_px)                  # after straightening, so it stays exact
 
     # geometric rim, measured from the render: a dark outer bevel edge, the grey rim band out to
     # --rim from the edge, then a dark groove; clip to the hexagon
@@ -807,8 +918,6 @@ def main():
                     help="keep thin line-work as traced instead of redrawing it as smooth strokes")
     ap.add_argument("--seams", action="store_true",
                     help="draw a black line wherever dark metal meets grey (--gunmetal grey)")
-    ap.add_argument("--no-blocks", dest="blocks", action="store_false",
-                    help="keep per-pixel colours inside panels (lighting highlights included)")
     ap.add_argument("--hatch-pitch", type=float, default=None,
                     help="line spacing for --gunmetal hatch, mm (default: 40%% grey coverage; "
                          "grey line = --min-feature wide)")

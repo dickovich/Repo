@@ -18,7 +18,7 @@ Each folder includes these preview images:
 - `side_*_face.png`: each face as it will print.
 - `compare_side_*.png`: the source render on the left, the print on the right.
 - `render_*.png`: 3D previews of the one-piece coin.
-- `detail_before_after.png` (0.2 mm folder only): the source, the previous version and this version, side by side.
+- `detail_circled_eagle.png` and `detail_circled_dfrx.png` (0.2 mm folder only): the areas circled in review, showing the source, the previous version and this version, side by side.
 
 `stl/previous/` holds earlier versions, kept for reference.
 
@@ -41,13 +41,22 @@ Each folder includes these preview images:
 
 1. **Rectify:** the render is mapped onto a regular hexagon using its six measured corners.
 2. **Flatten:** L0 gradient smoothing removes the metal texture, scratches and lighting noise while keeping edges sharp.
-3. **Classify:** each pixel is assigned a material by CIELAB lightness and hue. The darkest feathers are found by context, as compact regions enclosed by grooves on the eagle.
-4. **Solid panels:** each panel is the area enclosed by the render's black grooves, including the shallower grooves between neighbouring copper feathers. Each panel is filled with the one material it mostly contains. Highlight strips, reflections and shading inside a panel disappear, and the panel keeps its full outline. Thin grey strips along a copper, green or dark panel are that panel's bevel highlight, so they take the panel's colour.
-5. **Dark metal:** with four filaments the darker metal can't have its own colour, so dark-metal panels print grey. The black grooves keep each one distinct.
-6. **Straight edges:** each panel's outline is smoothed on its own, removing notches and spikes under 0.25 mm. A panel can grow only into black, so neighbouring panels never merge. The outline is then redrawn as a polygon. Lettering, the eye and the digits keep their traced curves.
-7. **Line-work:** side B's radar rings and the eagle side's dial ticks are redrawn as smooth strokes of constant width.
-8. **Lettering:** the render's own letterforms are kept. The render's typo "SECON**O**S" is corrected to **"SECONDS"** by turning the O into a D in the same typeface. The eye is traced from the render: almond socket, C-shaped iris and lid line. Side B's gem and crosshair are drawn as exact geometry.
-9. **Printable widths:** lines narrower than the nozzle can print are widened to the minimum. Grooves are widened evenly along their centreline, so they stay uniform. Each colour is then vectorised and cut from the coin body as a 0.6 mm inlay.
+3. **Facets** (`tools/facets.py`):
+   - **Segmenting:** the flattened render is split into small regions, then neighbouring regions are merged when they're the same material and no groove runs between them. The result is one region per armour plate, letter or panel.
+   - **Materials:** each facet gets one material: black, grey, copper or green. Dark-metal plates on the eagle print grey.
+   - **Bevels:** thin facets (bevel highlights, edge reflections) take the material of the plate they frame. On the eagle, a copper or green plate claims its own bevel first.
+4. **Plate edges:** wherever two metal plates meet along a groove in the render, even a faint one, a black line is kept between them, so plates stay distinct once all metal is grey.
+5. **Special areas:**
+   - **Eye:** traced per pixel (almond socket, C-shaped iris, lid line). The iris rings are then smoothed as concentric bands around their centre.
+   - **Talons:** traced from brightness, because they grip the dark ring and would otherwise merge with it.
+   - **Side B line-work:** redrawn exactly. The radar rings are true circles around the fitted radar centre (1.8 mm, 0.2 mm right of the face centre), drawn over the angles where the render has them. Their ticks become radial strokes, and spokes and frame lines become straight segments. Specks and texture are dropped.
+   - **Exact geometry:** side B's green markers are exact triangles, the gem is an exact square in a clean dark setting, and the crosshair is a straight bar.
+6. **Clean outlines:**
+   - **Notches:** shallow notches in a panel's outline, left by lighting along its edge, are filled.
+   - **Straight edges:** each panel is smoothed on its own (it can grow only into black, so panels never merge), then redrawn as a polygon. Side B's letters and X arms get a stronger pass.
+   - **Exceptions:** lettering, the eye and the digits keep their traced curves.
+7. **Lettering:** the render's own letterforms are kept. The typo "SECON**O**S" is corrected to **"SECONDS"** by turning the O into a D in the same typeface.
+8. **Printable widths:** lines narrower than the nozzle can print are widened to the minimum, with grooves widened evenly along their centreline. Each colour is then vectorised and cut from the coin body as a 0.6 mm inlay.
 
 ## Geometry (defaults)
 
@@ -70,6 +79,7 @@ Each folder includes these preview images:
 
 - **0.4 mm nozzle lettering:** the motto's strokes and letter gaps in the render are about 0.28–0.33 mm, which is below a 0.4 mm nozzle's width. They're kept as traced, and the slicer resolves them as best it can. The 000 / 131444 digits are widened to 0.38 mm, which partly closes the small counters in the 4s.
 - **One grey for all metal:** the render's two metal tones become one grey filament, so the dark-metal feathers are told apart only by their grooves.
+- **Remaining artefact:** a small grey wedge is left where a copper plate fades to grey at its tip in the render (the right tip of the copper chevron on the eagle's neck).
 
 ## Regenerating
 
@@ -85,6 +95,6 @@ Other options:
 - **Outline options:**
   - `--seams`: a black line wherever dark metal meets grey.
   - `--straighten`: the polygon tolerance in mm (0 turns straightening off).
-  - `--no-blocks` and `--no-smooth-lines`: keep panels and line-work as traced.
+  - `--no-smooth-lines`: keep line-work as traced.
 - **Coin geometry:** `--size`, `--thickness`, `--inlay`, `--chamfer`, `--rim`, `--rim-edge`.
 - **Debugging:** `COIN_DEBUG=<dir>` saves the label map after each processing stage.
