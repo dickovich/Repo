@@ -1,0 +1,54 @@
+  motto band width 63px
+{
+  "side_a_eagle": {
+    "dark": {
+      "triangles": 12006,
+      "volume_mm3": 1677.1,
+      "watertight": true
+    },
+    "silver": {
+      "triangles": 11632,
+      "volume_mm3": 414.4,
+      "watertight": true
+    },
+    "copper": {
+      "triangles": 2364,
+      "volume_mm3": 52.6,
+      "watertight": true
+    },
+    "green": {
+      "triangles": 1296,
+      "volume_mm3": 9.2,
+      "watertight": true
+    }
+  },
+  "side_b_dfrx": {
+    "dark": {
+      "triangles": 2332,
+      "volume_mm3": 1630.6,
+      "watertight": true
+    },
+    "silver": {
+      "triangles": 6784,
+      "volume_mm3": 456.3,
+      "watertight": true
+    },
+    "copper": {
+      "triangles": 3320,
+      "volume_mm3": 23.6,
+      "watertight": true
+    },
+    "green": {
+      "triangles": 1108,
+      "volume_mm3": 9.9,
+      "watertight": true
+    }
+  },
+  "params": {
+    "size": 50.0,
+    "base": 1.0,
+    "rim": 1.6,
+    "min_feature": 0.42,
+    "out": "/home/user/Repo/coin/stl"
+  }
+}
