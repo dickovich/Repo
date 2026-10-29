@@ -4,3 +4,4 @@ scikit-image
 manifold3d
 trimesh
 Pillow
+scipy

@@ -29,6 +29,8 @@ import trimesh
 from PIL import Image
 from skimage.morphology import skeletonize
 
+from lines import smooth_lines
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
@@ -124,6 +126,146 @@ def find_dark_feathers(src, flat, mm_px):
     # regrow by the sealing dilation so the feather meets its groove/highlight
     grown = cv2.dilate(feathers.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
     return grown & (L < 125)
+
+
+def eagle_mask(src, mm_px=2 * R_PX / 60, close_mm=3.0):
+    """The eagle's silhouette: bright metal (heavily smoothed brightness) away from the rim, frame
+    and motto band, largest region, closed so the dark feathers between bright ones are inside."""
+    v = cv2.cvtColor(src, cv2.COLOR_RGB2HSV)[..., 2].astype(np.float32)
+    m = cv2.GaussianBlur(v, (0, 0), 4) > 64
+    edge = cv2.distanceTransform(hex_mask(R_PX).astype(np.uint8), cv2.DIST_L2, 5)
+    rin, rout = band_profile()
+    # the motto band continues as the segmented outer ring round the dial: exclude that ring
+    # except where the talons grip it (lower right, 20-68 degrees)
+    ring = band_mask(rin, rout, -180, 20, pad=-6) | band_mask(rin, rout, 68, 180, pad=-6)
+    m &= (edge > 4.0 * mm_px) & ~ring
+    # open first so thin rings and ticks (< 0.8 mm) drop out; feathers and talons are wider
+    ko = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(0.8 * mm_px) | 1,) * 2)
+    m = cv2.morphologyEx(m.astype(np.uint8), cv2.MORPH_OPEN, ko)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(close_mm * mm_px) | 1,) * 2)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k)
+    n, cc, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    m = (cc == 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))).astype(np.uint8)
+    # fill small enclosed holes (dark feathers surrounded by bright ones), not the dial background
+    n, cc, st, _ = cv2.connectedComponentsWithStats(1 - m, connectivity=4)
+    holes = np.isin(cc, np.where(st[:, cv2.CC_STAT_AREA] < 40 * mm_px ** 2)[0])
+    return (m > 0) | holes
+
+
+def block_fill(lab, flat, dark_feathers, eagle, mm_px, groove_l=30, max_area_mm2=45):
+    """Solid colour per panel. The render's panels are separated by deep black grooves; inside a
+    panel the colour varies only through lighting (bevel highlights, shading). Label each
+    groove-bounded panel and fill it with one colour from what it mostly contains, so highlight
+    strips and shading disappear and every panel keeps its full outline. Large regions (dial
+    background, motto band, rim, frame) keep their per-pixel classes."""
+    L = cv2.cvtColor(flat, cv2.COLOR_RGB2LAB)[..., 0]
+    # grooves: deep black, or narrow lines clearly darker than both sides (shallow grooves
+    # between neighbouring copper feathers)
+    bh = cv2.morphologyEx(L, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+    groove = (L < groove_l) | ((bh > 35) & (L < 80))
+    sealed = cv2.dilate(groove.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    n, cc, st, _ = cv2.connectedComponentsWithStats((~sealed).astype(np.uint8), connectivity=4)
+    idx = cc.ravel()
+    count = np.bincount(idx, minlength=n).astype(float)
+    frac = {c: np.bincount(idx, weights=(lab.ravel() == c), minlength=n) / np.maximum(count, 1)
+            for c in (FIELD, SILVER, COPPER, GREEN, GUNMETAL)}
+    mean_l = np.bincount(idx, weights=L.ravel().astype(float), minlength=n) / np.maximum(count, 1)
+    feather = np.bincount(idx, weights=dark_feathers.ravel(), minlength=n) / np.maximum(count, 1)
+    on_eagle = np.bincount(idx, weights=eagle.ravel(), minlength=n) / np.maximum(count, 1)
+    colour = np.full(n, 255, np.uint8)                      # 255 = keep per-pixel classes
+    small = (st[:, cv2.CC_STAT_AREA] <= max_area_mm2 * mm_px ** 2)
+    small[0] = False
+    metal = frac[SILVER] + frac[GUNMETAL]
+    # fill a panel only when one material clearly dominates it; a region that mixes materials
+    # is several panels joined through breaks in the groove, and is resolved per sub-panel below
+    for i in np.nonzero(small)[0]:
+        cop, grn, sil = frac[COPPER][i], frac[GREEN][i], frac[SILVER][i]
+        dark = frac[GUNMETAL][i] + frac[FIELD][i]
+        if cop >= 0.65:
+            colour[i] = COPPER
+        elif grn >= 0.65:
+            colour[i] = GREEN
+        elif cop + grn <= 0.12:
+            if feather[i] < 0.5 and frac[FIELD][i] >= 0.6 and (on_eagle[i] < 0.6 or mean_l[i] < 40):
+                colour[i] = FIELD                           # background showing between parts
+            elif sil >= 0.8 * (sil + dark):
+                colour[i] = SILVER
+            elif sil <= 0.2 * (sil + dark) or feather[i] >= 0.5 or on_eagle[i] >= 0.6:
+                colour[i] = GUNMETAL                        # dark-metal panel
+    fill = colour[cc]
+    out = np.where(fill != 255, fill, lab).astype(np.uint8)
+    # dark panels on the eagle that join the background through a break in their groove are
+    # part of a large region: inside the eagle's outline, dark non-groove pixels are dark metal
+    inner = cv2.erode(eagle.astype(np.uint8), np.ones((int(0.5 * mm_px) | 1,) * 2, np.uint8)).astype(bool)
+    out[(fill == 255) & (cc > 0) & inner & (lab == FIELD) & (L >= 40)] = GUNMETAL
+    # mixed regions: one material per sub-panel, smoothed so each is a clean block
+    mixed = small[cc] & (fill == 255)
+    sub = np.where(np.isin(lab, (FIELD, GUNMETAL)), GUNMETAL, lab).astype(np.uint8)
+    sub = majority(sub, 5, [SILVER, COPPER, GREEN, GUNMETAL])
+    out[mixed] = sub[mixed]
+    # in mixed regions, thin grey strips along copper/green are bevel highlights: absorb them
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(0.35 * mm_px) | 1,) * 2)
+    grey = (out == SILVER) & (fill == 255)
+    thin = grey & ~cv2.morphologyEx(grey.astype(np.uint8), cv2.MORPH_OPEN, k).astype(bool)
+    for c in (COPPER, GREEN):
+        near = cv2.dilate((out == c).astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+        out[thin & near] = c
+    out[groove] = FIELD
+    # the seal ring (one pixel inside each panel edge) takes its panel's colour again
+    ring = sealed & ~groove
+    for c in (SILVER, COPPER, GREEN):
+        grown = cv2.dilate((fill == c).astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+        out[ring & grown] = c
+    return out
+
+
+def straighten(lab, eps_px, smooth_px=0):
+    """Redraw every colour region as a polygon (Douglas-Peucker, tolerance eps_px) so panel edges
+    are straight lines instead of traced raster steps. Each panel is first smoothed on its own
+    (closing then opening with a smooth_px disc: notches and spikes narrower than that go), and
+    may only grow into black, so neighbouring panels never merge. Painted grey, then copper, then
+    green over black. Contours are drawn in nesting order so nothing inside a hole is lost."""
+    out = np.full_like(lab, FIELD)
+    d = int(smooth_px) | 1
+    disc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d)) if smooth_px >= 2 else None
+    pad = d + 2
+    for c in (SILVER, COPPER, GREEN):
+        m = (lab == c).astype(np.uint8)
+        if disc is not None:
+            n, cc, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+            sm = np.zeros_like(m)
+            for i in range(1, n):
+                x, y, w, h, _ = st[i]
+                x0, y0 = max(x - pad, 0), max(y - pad, 0)
+                x1, y1 = min(x + w + pad, W), min(y + h + pad, H)
+                comp = (cc[y0:y1, x0:x1] == i).astype(np.uint8)
+                grown = cv2.morphologyEx(comp, cv2.MORPH_CLOSE, disc)
+                grown &= ((lab[y0:y1, x0:x1] == FIELD) | (comp > 0)).astype(np.uint8)
+                grown = cv2.morphologyEx(grown, cv2.MORPH_OPEN, disc)
+                if grown.sum() < 0.5 * comp.sum():
+                    grown = comp                            # too thin to smooth: keep as traced
+                sm[y0:y1, x0:x1] |= grown
+            m = sm
+        cs, hier = cv2.findContours(m, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+        if hier is None:
+            continue
+        parent = hier[0][:, 3]
+        depth = np.zeros(len(cs), int)
+        for i in range(len(cs)):
+            j = parent[i]
+            while j >= 0:
+                depth[i] += 1
+                j = parent[j]
+        canvas = np.zeros_like(m)
+        for dd in range(depth.max() + 1):
+            polys = [cv2.approxPolyDP(cs[i], eps_px, True) for i in np.nonzero(depth == dd)[0]]
+            polys = [p for p in polys if len(p) >= 3]
+            if polys:
+                cv2.fillPoly(canvas, polys, 1 if dd % 2 == 0 else 0)
+        # a part too small to keep three vertices keeps its traced pixels
+        out[(canvas > 0) | ((m > 0) & (cv2.erode(m, np.ones((3, 3), np.uint8)) == 0)
+                           & (cv2.dilate(canvas, np.ones((3, 3), np.uint8)) == 0))] = c
+    return out
 
 
 def hatch_gunmetal(lab, line_px, pitch_px):
@@ -316,15 +458,60 @@ def to_trimesh(man):
 
 
 def thicken_lines(mask, min_px):
-    """Widen the thin parts of a large connected region (e.g. dark outlines between facets)."""
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(min_px) | 1, int(min_px) | 1))
+    """Widen the narrow parts of a large connected region (dark grooves between facets) to
+    min_px. Works on the whole region's centreline, so a groove whose width hovers around the
+    minimum is widened as one uniform band, not as a string of bumps."""
     m8 = mask.astype(np.uint8)
-    thin = mask & ~cv2.morphologyEx(m8, cv2.MORPH_OPEN, k).astype(bool)
-    sk = skeletonize(thin).astype(np.uint8)
-    n, cc, st, _ = cv2.connectedComponentsWithStats(sk, connectivity=8)
-    long_ = np.where(st[:, cv2.CC_STAT_AREA] >= 1.5 * min_px)[0]
-    sk = np.isin(cc, long_[long_ != 0])
-    return mask | cv2.dilate(sk.astype(np.uint8), k).astype(bool)
+    sk = skeletonize(mask).astype(np.uint8)
+    # prune short spurs (skeleton branches into edge irregularities)
+    nb = np.ones((3, 3), np.float32)
+    nb[1, 1] = 0
+    for _ in range(int(min_px)):
+        ends = (sk > 0) & (cv2.filter2D(sk, -1, nb, borderType=cv2.BORDER_CONSTANT) <= 1)
+        sk[ends] = 0
+    width = 2 * cv2.distanceTransform(m8, cv2.DIST_L2, 5)
+    narrow = (sk > 0) & (width < min_px)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(min_px) | 1, int(min_px) | 1))
+    return mask | cv2.dilate(narrow.astype(np.uint8), k).astype(bool)
+
+
+def _debug(lab, name, tag):
+    """COIN_DEBUG=dir saves the label map after each stage (for tuning)."""
+    d = os.environ.get("COIN_DEBUG")
+    if d:
+        prev = np.full((H, W, 3), 255, np.uint8)
+        for c, rgb in PREVIEW_RGB.items():
+            prev[lab == c] = rgb
+        Image.fromarray(prev).save(os.path.join(d, f"{name}_{tag}.png"))
+
+
+def traced_zones(name, mm_px):
+    """Areas that keep their traced curves instead of being polygonised: lettering, the eye,
+    the engraved digits."""
+    if name == "side_a_eagle":
+        rin, rout = band_profile()
+        z = band_mask(rin, rout, -128, 8, pad=0)
+        yy, xx = np.mgrid[0:H, 0:W]
+        z |= np.hypot(xx - 1052, yy - 647) < 60
+    else:
+        x0, y0, x1, y1 = TAGLINE[1]
+        z = np.zeros((H, W), bool)
+        z[y0 - 8:y1 + 8, x0 - 8:x1 + 8] = True
+        for _, c, ang, _, wipe in NUMBERS:
+            z |= rotated_box(c, ang, wipe)
+    return z
+
+
+def straighten_panels(lab, keep, mm_px, eps_mm, smooth_mm=0.25):
+    """Polygonise solid panels; thin line-work and the keep areas stay as they are."""
+    keep = keep.copy()
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(0.6 * mm_px) | 1,) * 2)
+    for c in (SILVER, COPPER, GREEN):
+        m = (lab == c).astype(np.uint8)
+        keep |= (m > 0) & ~cv2.dilate(cv2.morphologyEx(m, cv2.MORPH_OPEN, k),
+                                      np.ones((5, 5), np.uint8)).astype(bool)
+    keep = cv2.dilate(keep.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+    return np.where(keep, lab, straighten(lab, eps_mm * mm_px, smooth_mm * mm_px)).astype(np.uint8)
 
 
 def label_side(name, args):
@@ -336,16 +523,42 @@ def label_side(name, args):
     lab = classify(flat)
     raw = lab.copy()                                        # before clean-up, for small lettering
     if name == "side_a_eagle":
-        lab[find_dark_feathers(src, flat, mm_px) & (lab == FIELD)] = GUNMETAL
+        dark_feathers = find_dark_feathers(src, flat, mm_px)
+        lab[dark_feathers & (lab == FIELD)] = GUNMETAL
         lab[eye_lid_line(flat)] = GREEN
+        if args.blocks:
+            # tight outline here: a looser one bridges into background panels behind the talons
+            lab = block_fill(lab, flat, dark_feathers, eagle_mask(src, close_mm=1.5), mm_px)
     lab = majority(lab, 3, [FIELD, SILVER, COPPER, GREEN, GUNMETAL])
     for cls in (SILVER, COPPER, GREEN, GUNMETAL, FIELD):
         lab = drop_specks(lab, cls, min_px ** 2, None)
+    _debug(lab, name, "1_clean")
+
+    if name == "side_a_eagle":
+        # thin grey strips along a dark, copper or green panel are that panel's bevel highlight
+        # (lighting, not artwork): they take the panel's colour
+        bird = eagle_mask(src)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(0.4 * mm_px) | 1,) * 2)
+        grey = (lab == SILVER).astype(np.uint8)
+        thin = (grey > 0) & ~cv2.morphologyEx(grey, cv2.MORPH_OPEN, k).astype(bool) & bird
+        for c in (GUNMETAL, COPPER, GREEN):
+            near = cv2.dilate((lab == c).astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+            lab[thin & near & (lab == SILVER)] = c
 
     if name == "side_b_dfrx":
         # on this face the mid-grey pixels are the dimmer stretches of the silver radar lines
         lab[lab == GUNMETAL] = SILVER
     elif args.gunmetal == "grey":
+        # dark and grey panels become the same filament: keep the groove that divides them
+        # (only where it is a real panel edge: the render's own grooves already are; a dark/grey
+        # boundary inside a panel is shading, and gets no line)
+        if args.seams:
+            gm = (lab == GUNMETAL).astype(np.uint8)
+            sv = (lab == SILVER).astype(np.uint8)
+            r = max(1, int(round(max(min_px, 0.3 * mm_px) / 2)))
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+            seam = cv2.dilate(gm, k).astype(bool) & cv2.dilate(sv, k).astype(bool)
+            lab[seam & np.isin(lab, (GUNMETAL, SILVER))] = FIELD
         lab[lab == GUNMETAL] = SILVER
     elif args.gunmetal == "black":
         lab[lab == GUNMETAL] = FIELD                        # grey bevel edges outline them
@@ -354,15 +567,44 @@ def label_side(name, args):
         pitch = args.hatch_pitch or args.min_feature / 0.4
         lab = hatch_gunmetal(lab, min_px, pitch * mm_px)
 
+    # straight panel edges first, so the grooves widened below follow straight lines
+    if args.straighten > 0:
+        lab = straighten_panels(lab, traced_zones(name, mm_px), mm_px, args.straighten)
+    _debug(lab, name, "2_straight")
+
     # widen hairlines to the printable minimum: isolated light strokes first, then the dark
     # outlines between facets (dark wins, so facets stay separated)
     for cls in (COPPER, GREEN, SILVER, GUNMETAL):
         grow = thicken(lab == cls, min_px) & (lab == FIELD)
         lab[grow] = cls
+    _debug(lab, name, "3_light")
     dark = lab == FIELD
     lab[thicken_lines(dark, min_px) & ~dark] = FIELD
+    _debug(lab, name, "4_dark")
     for cls in (SILVER, COPPER, GREEN, GUNMETAL):           # sub-minimum slivers left behind
         lab = drop_specks(lab, cls, (0.8 * min_px) ** 2, FIELD)
+    _debug(lab, name, "5_slivers")
+
+    # thin line-work (radar and dial rings, spokes, ticks) redrawn as smooth constant-width
+    # strokes; on the eagle face only outside the eagle, whose feather points stay as traced
+    if args.smooth_lines:
+        if name == "side_b_dfrx":
+            scope = np.ones_like(lab, bool)
+        else:
+            # only the dial's tick ring under the motto band, kept 3 mm clear of the eagle so
+            # claw tips and feather points are not treated as lines
+            rin, rout = band_profile()
+            yy, xx = np.mgrid[0:H, 0:W]
+            ang = np.degrees(np.arctan2(yy - BAND_C[1], xx - BAND_C[0]))
+            rad = np.hypot(xx - BAND_C[0], yy - BAND_C[1])
+            ticks = (ang >= -135) & (ang <= 25) & (rad < rin(ang) - 2) & (rad > rin(ang) - 4.5 * mm_px)
+            scope = ticks & ~cv2.dilate(eagle_mask(src).astype(np.uint8),
+                                        np.ones((int(3 * mm_px) | 1,) * 2, np.uint8)).astype(bool)
+        for c in (SILVER,):                                 # green glow halos stay as traced
+            m = (lab == c) & scope
+            sm = smooth_lines(m, min_px, 0.6 * mm_px, sigma=3.0) & scope
+            lab[m & ~sm] = FIELD
+            lab[sm & (lab == FIELD)] = c
 
     # lettering keeps the render's own letterforms: its counters and letter gaps (~0.28 mm) are
     # finer than a 0.4 nozzle's clean-up minimum, so lettering zones get only the fine clean-up
@@ -444,6 +686,10 @@ def label_side(name, args):
         half = max(3.0, min_px / 2)
         for y0, y1 in CROSSHAIR_Y:
             lab[y0:y1, int(round(CROSSHAIR_X - half)):int(round(CROSSHAIR_X + half)) + 1] = GREEN
+
+    # final pass: straighten edges touched by the widening and the redraws above
+    if args.straighten > 0:
+        lab = straighten_panels(lab, traced_zones(name, mm_px), mm_px, args.straighten)
 
     # geometric rim, measured from the render: a dark outer bevel edge, the grey rim band out to
     # --rim from the edge, then a dark groove; clip to the hexagon
@@ -552,9 +798,17 @@ def main():
     ap.add_argument("--rim-edge", type=float, default=0.35, help="dark outer bevel edge of the rim, mm")
     ap.add_argument("--min-feature", type=float, default=0.38,
                     help="thinnest printable stroke, mm (0.38 for a 0.4 nozzle, 0.22 for 0.2)")
-    ap.add_argument("--gunmetal", choices=("hatch", "black", "grey", "filament"), default="hatch",
+    ap.add_argument("--gunmetal", choices=("grey", "hatch", "black", "filament"), default="grey",
                     help="darker-metal feathers: fine grey hatching on black (reads as dark metal), "
                          "solid black (grey bevel edges outline them), solid grey, or a 5th filament")
+    ap.add_argument("--straighten", type=float, default=0.09,
+                    help="polygon tolerance for straight panel edges, mm (0 = off)")
+    ap.add_argument("--no-smooth-lines", dest="smooth_lines", action="store_false",
+                    help="keep thin line-work as traced instead of redrawing it as smooth strokes")
+    ap.add_argument("--seams", action="store_true",
+                    help="draw a black line wherever dark metal meets grey (--gunmetal grey)")
+    ap.add_argument("--no-blocks", dest="blocks", action="store_false",
+                    help="keep per-pixel colours inside panels (lighting highlights included)")
     ap.add_argument("--hatch-pitch", type=float, default=None,
                     help="line spacing for --gunmetal hatch, mm (default: 40%% grey coverage; "
                          "grey line = --min-feature wide)")
