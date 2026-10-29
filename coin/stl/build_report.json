@@ -1,54 +1,77 @@
   motto band width 63px
 {
-  "side_a_eagle": {
+  "coin_one_piece": {
     "dark": {
-      "triangles": 12006,
-      "volume_mm3": 1677.1,
+      "triangles": 41602,
+      "volume_mm3": 6898.4,
       "watertight": true
     },
     "silver": {
-      "triangles": 11632,
-      "volume_mm3": 414.4,
+      "triangles": 34390,
+      "volume_mm3": 884.5,
       "watertight": true
     },
     "copper": {
-      "triangles": 2364,
-      "volume_mm3": 52.6,
+      "triangles": 7712,
+      "volume_mm3": 102.0,
       "watertight": true
     },
     "green": {
-      "triangles": 1296,
-      "volume_mm3": 9.2,
+      "triangles": 3848,
+      "volume_mm3": 40.4,
       "watertight": true
     }
   },
-  "side_b_dfrx": {
+  "half_a_eagle": {
     "dark": {
-      "triangles": 2332,
-      "volume_mm3": 1630.6,
+      "triangles": 26366,
+      "volume_mm3": 3424.2,
       "watertight": true
     },
     "silver": {
-      "triangles": 6784,
-      "volume_mm3": 456.3,
+      "triangles": 21646,
+      "volume_mm3": 445.3,
       "watertight": true
     },
     "copper": {
-      "triangles": 3320,
-      "volume_mm3": 23.6,
+      "triangles": 3900,
+      "volume_mm3": 74.6,
       "watertight": true
     },
     "green": {
-      "triangles": 1108,
-      "volume_mm3": 9.9,
+      "triangles": 2168,
+      "volume_mm3": 18.8,
+      "watertight": true
+    }
+  },
+  "half_b_dfrx": {
+    "dark": {
+      "triangles": 15260,
+      "volume_mm3": 3474.2,
+      "watertight": true
+    },
+    "silver": {
+      "triangles": 12742,
+      "volume_mm3": 439.2,
+      "watertight": true
+    },
+    "copper": {
+      "triangles": 3812,
+      "volume_mm3": 27.3,
+      "watertight": true
+    },
+    "green": {
+      "triangles": 1680,
+      "volume_mm3": 21.6,
       "watertight": true
     }
   },
   "params": {
-    "size": 50.0,
-    "base": 1.0,
-    "rim": 1.6,
-    "min_feature": 0.42,
-    "out": "/home/user/Repo/coin/stl"
+    "size": 60.0,
+    "thickness": 3.4,
+    "inlay": 0.6,
+    "chamfer": 0.4,
+    "rim": 1.8,
+    "min_feature": 0.38
   }
 }

@@ -6,11 +6,13 @@ Pipeline per side:
   3. Side A only: erase the misspelt motto ("SECONOS") and re-letter it along the band.
   4. Replace the rendered rim with a clean geometric rim.
   5. Clean up: majority filter, drop specks, thicken hairlines to the printable minimum.
-  6. Vectorise each class, extrude to its relief height, union per filament colour.
+  6. Vectorise each colour and cut it out of the coin body as a flat inlay.
 
-Each side is a half-coin printed face-up; the two halves are glued back-to-back.
+Flat faces: each face is a level colour inlay (--inlay deep). The one-piece coin prints with the
+eagle face against the build plate and the dFRX face inlaid in the top layers; face-down halves
+for gluing are also exported.
 
-Usage: python3 tools/build_coin.py [--size 50] [--min-feature 0.42]
+Usage: python3 tools/build_coin.py [--size 60] [--min-feature 0.38]
 """
 import argparse
 import json
@@ -85,6 +87,11 @@ def classify(rgb):
 
 def majority(lab, k, classes):
     votes = np.stack([cv2.blur((lab == c).astype(np.float32), (k, k)) for c in classes])
+    return np.asarray(classes, np.uint8)[votes.argmax(0)]
+
+
+def soft_majority(lab, sigma, classes):
+    votes = np.stack([cv2.GaussianBlur((lab == c).astype(np.float32), (0, 0), sigma) for c in classes])
     return np.asarray(classes, np.uint8)[votes.argmax(0)]
 
 
@@ -220,7 +227,7 @@ def mask_to_cs(mask, px_mm):
     for c in cs:
         if len(c) < 3:
             continue
-        c = cv2.approxPolyDP(c, 0.7, True).reshape(-1, 2).astype(float)
+        c = cv2.approxPolyDP(c, 0.6, True).reshape(-1, 2).astype(float)
         if len(c) < 3:
             continue
         polys.append(np.c_[(c[:, 0] - CX) * px_mm, (CY - c[:, 1]) * px_mm])
@@ -241,115 +248,176 @@ def to_trimesh(man):
                            faces=np.asarray(mesh.tri_verts), process=True)
 
 
-def build_side(name, args):
-    px_mm = args.size / (2 * R_PX)                          # mm per raster pixel
-    mm_px = 1 / px_mm
+def thicken_lines(mask, min_px):
+    """Widen the thin parts of a large connected region (e.g. dark outlines between facets)."""
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(min_px) | 1, int(min_px) | 1))
+    m8 = mask.astype(np.uint8)
+    thin = mask & ~cv2.morphologyEx(m8, cv2.MORPH_OPEN, k).astype(bool)
+    sk = skeletonize(thin).astype(np.uint8)
+    n, cc, st, _ = cv2.connectedComponentsWithStats(sk, connectivity=8)
+    long_ = np.where(st[:, cv2.CC_STAT_AREA] >= 1.5 * min_px)[0]
+    sk = np.isin(cc, long_[long_ != 0])
+    return mask | cv2.dilate(sk.astype(np.uint8), k).astype(bool)
+
+
+def label_side(name, args):
+    """Classified, cleaned label map for one face (unmirrored, as seen)."""
+    mm_px = 2 * R_PX / args.size                            # raster pixels per mm
+    min_px = args.min_feature * mm_px
     lab = classify(rectify(name))
 
-    # clean-up: majority vote then remove specks smaller than 0.6 x 0.6 mm
-    lab = majority(lab, 5, [FIELD, SILVER, COPPER, GREEN, GUNMETAL])
-    for cls in (GUNMETAL, SILVER, COPPER, GREEN):
-        lab = drop_specks(lab, cls, (0.6 * mm_px) ** 2, None)
+    # smooth class boundaries (Gaussian-weighted majority vote) so metal texture does not leave
+    # ragged edges, then drop specks below the printable minimum
+    lab = soft_majority(lab, 1.3, [FIELD, SILVER, COPPER, GREEN, GUNMETAL])
+    for cls in (SILVER, COPPER, GREEN, FIELD):
+        lab = drop_specks(lab, cls, min_px ** 2, None)
 
-    # lettering is redrawn from a font after clean-up so it stays crisp
+    # a flat face has no relief to show the darker metal, so gunmetal feathers print as silver
+    # (the dark outlines around each feather keep the facets distinct); small gunmetal specks
+    # are background texture and go dark
+    n, cc, st, _ = cv2.connectedComponentsWithStats((lab == GUNMETAL).astype(np.uint8), connectivity=4)
+    big = np.isin(cc, np.where(st[:, cv2.CC_STAT_AREA] >= (1.2 * mm_px) ** 2)[0][1:])
+    lab[(lab == GUNMETAL) & big] = SILVER
+    lab[lab == GUNMETAL] = FIELD
+
+    # widen hairlines to the printable minimum: isolated light strokes first, then the dark
+    # outlines between facets (dark wins, so facets stay separated)
+    for cls in (COPPER, GREEN, SILVER):
+        grow = thicken(lab == cls, min_px) & (lab == FIELD)
+        lab[grow] = cls
+    dark = lab == FIELD
+    lab[thicken_lines(dark, min_px) & ~dark] = FIELD
+    for cls in (SILVER, COPPER, GREEN):                     # sub-minimum slivers left behind
+        lab = drop_specks(lab, cls, (0.8 * min_px) ** 2, FIELD)
+
+    # lettering is redrawn from a font last so nothing above erodes it
     if name == "side_a_eagle":
         lab = reletter_motto(lab)
     else:
+        # copper on this face is lettering only; other copper pixels are bronze reflections on
+        # the silver radar lines in the render
+        text = np.zeros_like(lab, bool)
+        text[815:900, :] = True                             # DRONE AS FIRST RESPONDER
+        lab[(lab == COPPER) & ~text] = SILVER
         lab = reletter_numbers(lab)
 
-    # thicken hairlines (silver radar lines, copper lettering, green ticks, motto ink)
-    min_px = args.min_feature * mm_px
-    for cls, into in ((COPPER, (FIELD, GUNMETAL)),
-                      (GREEN, (FIELD, GUNMETAL)), (SILVER, (FIELD, GUNMETAL))):
-        grow = thicken(lab == cls, min_px) & np.isin(lab, into)
-        lab[grow] = cls
-
-    # geometric rim + clip to hexagon
+    # geometric rim + clean groove inside it, clip to hexagon
     rim_px = args.rim * mm_px
-    outer = hex_mask(R_PX)
-    inner = hex_mask(R_PX - rim_px * 2 / np.sqrt(3))        # inset measured across flats
-    lab[outer & ~inner] = RIM
-    lab[~outer] = 255
-    lab[inner & ~hex_mask(R_PX - (rim_px + args.min_feature * mm_px) * 2 / np.sqrt(3))
-        & ~np.isin(lab, (FIELD,))] = FIELD                  # keep a clean groove inside the rim
+    inner = hex_mask(R_PX - rim_px * 2 / np.sqrt(3))
+    groove = inner & ~hex_mask(R_PX - (rim_px + min_px) * 2 / np.sqrt(3))
+    lab[groove] = FIELD
+    lab[hex_mask(R_PX) & ~inner] = RIM
+    lab[~hex_mask(R_PX)] = 255
 
-    # preview
-    prev = np.zeros((H, W, 3), np.uint8)
+    prev = np.full((H, W, 3), 255, np.uint8)
     for c, rgb in PREVIEW_RGB.items():
         prev[lab == c] = rgb
-    Image.fromarray(prev).save(os.path.join(args.out, f"{name}_preview.png"))
+    Image.fromarray(prev).save(os.path.join(args.out, f"{name}_face.png"))
+    return lab
 
-    # relief heights (mm) of each class top surface; base plate is dark, 0..BASE
-    base = args.base
-    top = {FIELD: base, GUNMETAL: base + 0.4, GREEN: base + 0.4, INK: base + 0.6,
-           COPPER: base + 0.6, SILVER: base + 0.8, RIM: base + 1.0}
 
-    # disjoint cross-sections, priority high -> low so boundaries are shared, not doubled
-    order = [RIM, SILVER, INK, COPPER, GREEN, GUNMETAL]
-    taken = m3d.CrossSection()
-    secs = {}
+def face_sections(lab, args, mirror):
+    """Disjoint silver / copper / green cross-sections (mm) for one face."""
+    px_mm = args.size / (2 * R_PX)
     hexsec = hex_cs(args.size / 2)
-    for cls in order:
-        sec = (mask_to_cs(lab == cls, px_mm) ^ hexsec) - taken
+    taken = m3d.CrossSection()
+    out = {}
+    for f, classes in (("silver", (SILVER, RIM)), ("copper", (COPPER,)), ("green", (GREEN,))):
+        sec = clean((mask_to_cs(np.isin(lab, classes), px_mm) ^ hexsec) - taken)
         taken = taken + sec
-        if sec.area() > 0:
-            secs[cls] = sec
+        out[f] = sec.mirror((1, 0)) if mirror else sec
+    return out
 
-    # per filament, stack slabs between successive top heights; a tiny open + close removes
-    # zero-width slivers and fuses corner-touching regions so every STL is a clean 2-manifold
-    eps = 0.004
+
+def coin_body(r, thickness, chamfer_bottom, chamfer_top):
+    """Hexagonal prism with 45-degree edge chamfers (chamfer given across flats, mm)."""
+    def ring(rr, z):
+        return [(rr * np.cos(np.radians(a)), rr * np.sin(np.radians(a)), z) for a in range(0, 360, 60)]
+    k = 2 / np.sqrt(3)
+    pts = (ring(r - chamfer_bottom * k, 0) + ring(r, chamfer_bottom) +
+           ring(r, thickness - chamfer_top) + ring(r - chamfer_top * k, thickness))
+    return m3d.Manifold.hull_points(pts)
+
+
+def clean(sec, eps=0.004):
+    """Tiny open + close: drop zero-width slivers, fuse corner-touching regions (clean manifolds)."""
+    sec = sec.offset(-2 * eps, m3d.JoinType.Miter).offset(2 * eps, m3d.JoinType.Miter)
+    sec = sec.offset(eps, m3d.JoinType.Miter).offset(-eps / 2, m3d.JoinType.Miter)
+    return sec.simplify(eps / 4)
+
+
+def assemble(body, hexsec, thickness, inlays):
+    """inlays: list of (sections dict, z0, z1). Returns filament -> Manifold.
+
+    Dark is built explicitly (core slab + the dark remainder of each inlay) rather than as
+    body minus colours, so it gets the same sliver clean-up and stays a clean 2-manifold.
+    """
     parts = {f: [] for f in FILAMENTS}
-    parts["dark"].append(m3d.Manifold.extrude(hexsec, base))
-    for f in FILAMENTS:
-        classes = [c for c in secs if FILAMENT[c] == f]
-        z0 = base
-        for z in sorted({top[c] for c in classes}):
-            sec = m3d.CrossSection.batch_boolean([secs[c] for c in classes if top[c] >= z],
-                                                 m3d.OpType.Add)
-            sec = sec.offset(-2 * eps, m3d.JoinType.Miter).offset(2 * eps, m3d.JoinType.Miter)
-            sec = sec.offset(eps, m3d.JoinType.Miter).offset(-eps / 2, m3d.JoinType.Miter)
-            sec = sec.simplify(eps / 4)
-            parts[f].append(m3d.Manifold.extrude(sec, z - z0).translate((0, 0, z0)))
-            z0 = z
+    core0, core1 = 0.0, thickness
+    for secs, z0, z1 in inlays:
+        colour = m3d.CrossSection.batch_boolean([s for s in secs.values() if s.area() > 0],
+                                                m3d.OpType.Add)
+        secs = dict(secs, dark=clean(hexsec - colour))
+        for f, sec in secs.items():
+            if sec.area() > 0:
+                parts[f].append(m3d.Manifold.extrude(sec, z1 - z0).translate((0, 0, z0)) ^ body)
+        if z0 <= 0:
+            core0 = z1
+        else:
+            core1 = z0
+    slab = m3d.Manifold.extrude(hexsec, core1 - core0).translate((0, 0, core0))
+    parts["dark"].append(slab ^ body)
+    return {f: m3d.Manifold.batch_boolean(parts[f], m3d.OpType.Add) for f in FILAMENTS if parts[f]}
 
-    stats = {}
-    meshes = {}
-    for f in FILAMENTS:
-        if not parts[f]:
-            continue
-        man = m3d.Manifold.batch_boolean(parts[f], m3d.OpType.Add)
+
+def export(parts, out_dir, stem):
+    stats, meshes = {}, {}
+    for f, man in parts.items():
         tm = to_trimesh(man)
-        path = os.path.join(args.out, f"{name}_{f}.stl")
-        tm.export(path)
+        tm.export(os.path.join(out_dir, f"{stem}_{f}.stl"))
         meshes[f] = tm
         stats[f] = dict(triangles=len(tm.faces), volume_mm3=round(tm.volume, 1),
                         watertight=bool(tm.is_watertight))
-    return meshes, stats
-
-
-def export_3mf(meshes, path):
     scene = trimesh.Scene()
     for f, tm in meshes.items():
         scene.add_geometry(tm, node_name=f, geom_name=f)
-    scene.export(path)
+    scene.export(os.path.join(out_dir, f"{stem}_4colour.3mf"))
+    return stats
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--size", type=float, default=50.0, help="hexagon width across corners, mm")
-    ap.add_argument("--base", type=float, default=1.0, help="base plate thickness per half, mm")
-    ap.add_argument("--rim", type=float, default=1.6, help="rim width, mm")
-    ap.add_argument("--min-feature", type=float, default=0.42,
-                    help="thinnest printable stroke, mm (0.42 for a 0.4 nozzle, 0.25 for 0.2)")
+    ap.add_argument("--size", type=float, default=60.0, help="hexagon width across corners, mm")
+    ap.add_argument("--thickness", type=float, default=3.4, help="finished coin thickness, mm")
+    ap.add_argument("--inlay", type=float, default=0.6, help="colour inlay depth per face, mm")
+    ap.add_argument("--chamfer", type=float, default=0.4, help="45-degree edge chamfer, mm")
+    ap.add_argument("--rim", type=float, default=1.8, help="rim width, mm")
+    ap.add_argument("--min-feature", type=float, default=0.38,
+                    help="thinnest printable stroke, mm (0.38 for a 0.4 nozzle, 0.22 for 0.2)")
     ap.add_argument("--out", default=os.path.join(ROOT, "stl"))
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
+
+    lab_a = label_side("side_a_eagle", args)
+    lab_b = label_side("side_b_dfrx", args)
+    r, t, d, c = args.size / 2, args.thickness, args.inlay, args.chamfer
     report = {}
-    for name in SRC_CORNERS:
-        meshes, stats = build_side(name, args)
-        export_3mf(meshes, os.path.join(args.out, f"{name}_4colour.3mf"))
-        report[name] = stats
-    report["params"] = vars(args)
+
+    # one-piece coin: eagle face printed against the plate (mirrored so it reads correctly once
+    # flipped), dFRX face inlaid in the top layers
+    hexsec = hex_cs(r)
+    body = coin_body(r, t, c, c)
+    parts = assemble(body, hexsec, t, [(face_sections(lab_a, args, True), 0, d),
+                            (face_sections(lab_b, args, False), t - d, t)])
+    report["coin_one_piece"] = export(parts, args.out, "coin_one_piece")
+
+    # alternative: two face-down halves to glue back-to-back (both faces get the plate finish)
+    for name, lab in (("half_a_eagle", lab_a), ("half_b_dfrx", lab_b)):
+        body = coin_body(r, t / 2, c, 0)
+        parts = assemble(body, hexsec, t / 2, [(face_sections(lab, args, True), 0, d)])
+        report[name] = export(parts, args.out, name)
+
+    report["params"] = {k: v for k, v in vars(args).items() if k != "out"}
     print(json.dumps(report, indent=2))
 
 
