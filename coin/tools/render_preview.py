@@ -11,12 +11,13 @@ from PIL import Image
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COLOURS = {"dark": (0.17, 0.17, 0.18), "silver": (0.80, 0.81, 0.83),
-           "copper": (0.82, 0.48, 0.30), "green": (0.55, 0.92, 0.15)}
-LIGHT = np.array([-0.45, 0.55, 0.70])
+           "copper": (0.82, 0.48, 0.30), "green": (0.55, 0.92, 0.15),
+           "gunmetal": (0.40, 0.40, 0.42)}
+LIGHT = np.array([-0.25, 0.35, 0.90])                # near face-on, as a coin is viewed
 LIGHT /= np.linalg.norm(LIGHT)
 
 
-def render(stl_dir, stem, out, px_per_mm=20, tilt_deg=25, z_exag=1.0, from_below=False):
+def render(stl_dir, stem, out, px_per_mm=30, tilt_deg=25, z_exag=1.0, from_below=False):
     t = np.radians(tilt_deg)
     rot = np.array([[1, 0, 0], [0, np.cos(t), -np.sin(t)], [0, np.sin(t), np.cos(t)]])
     if from_below:                                           # flip the coin over (about its y axis)

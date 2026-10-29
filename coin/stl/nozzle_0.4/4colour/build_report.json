@@ -1,0 +1,78 @@
+  motto band width 63px
+{
+  "coin_one_piece": {
+    "dark": {
+      "triangles": 52732,
+      "volume_mm3": 6869.5,
+      "watertight": true
+    },
+    "silver": {
+      "triangles": 48022,
+      "volume_mm3": 914.1,
+      "watertight": true
+    },
+    "copper": {
+      "triangles": 10352,
+      "volume_mm3": 96.0,
+      "watertight": true
+    },
+    "green": {
+      "triangles": 4336,
+      "volume_mm3": 46.7,
+      "watertight": true
+    }
+  },
+  "half_a_eagle": {
+    "dark": {
+      "triangles": 32164,
+      "volume_mm3": 3444.6,
+      "watertight": true
+    },
+    "silver": {
+      "triangles": 29614,
+      "volume_mm3": 434.3,
+      "watertight": true
+    },
+    "copper": {
+      "triangles": 7140,
+      "volume_mm3": 65.5,
+      "watertight": true
+    },
+    "green": {
+      "triangles": 2008,
+      "volume_mm3": 18.9,
+      "watertight": true
+    }
+  },
+  "half_b_dfrx": {
+    "dark": {
+      "triangles": 20592,
+      "volume_mm3": 3424.9,
+      "watertight": true
+    },
+    "silver": {
+      "triangles": 18406,
+      "volume_mm3": 479.7,
+      "watertight": true
+    },
+    "copper": {
+      "triangles": 3212,
+      "volume_mm3": 30.4,
+      "watertight": true
+    },
+    "green": {
+      "triangles": 2328,
+      "volume_mm3": 27.8,
+      "watertight": true
+    }
+  },
+  "params": {
+    "size": 60.0,
+    "thickness": 3.4,
+    "inlay": 0.6,
+    "chamfer": 0.4,
+    "rim": 1.8,
+    "min_feature": 0.38,
+    "gunmetal": "dark"
+  }
+}

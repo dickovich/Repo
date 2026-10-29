@@ -2,8 +2,11 @@
 
 Pipeline per side:
   1. Rectify the (slightly perspective) render onto a regular flat-top hexagon.
-  2. Classify every pixel into a material class (field, gunmetal, silver, copper, green).
-  3. Side A only: erase the misspelt motto ("SECONOS") and re-letter it along the band.
+  2. Flatten the render with L0 gradient smoothing (texture and lighting noise go, facet edges
+     stay sharp), then classify each pixel by CIELAB lightness/hue: field, gunmetal, silver,
+     copper, green. Side A: recover the darkest feathers by context (enclosed compact regions).
+  3. Redraw lettering from fonts (fixing the "SECONOS" typo), the eagle's eye and side B's
+     crosshair as exact geometry.
   4. Replace the rendered rim with a clean geometric rim.
   5. Clean up: majority filter, drop specks, thicken hairlines to the printable minimum.
   6. Vectorise each colour and cut it out of the coin body as a flat inlay.
@@ -12,7 +15,7 @@ Flat faces: each face is a level colour inlay (--inlay deep). The one-piece coin
 eagle face against the build plate and the dFRX face inlaid in the top layers; face-down halves
 for gluing are also exported.
 
-Usage: python3 tools/build_coin.py [--size 60] [--min-feature 0.38]
+Usage: python3 tools/build_coin.py [--size 60] [--min-feature 0.38] [--gunmetal dark|silver|filament]
 """
 import argparse
 import json
@@ -43,11 +46,11 @@ SRC_CORNERS = {
 FIELD, SILVER, COPPER, GREEN, GUNMETAL, RIM, INK = range(7)
 
 # filament each class is printed in
-FILAMENT = {FIELD: "dark", GUNMETAL: "dark", INK: "dark",
+FILAMENT = {FIELD: "dark", GUNMETAL: "gunmetal", INK: "dark",
             SILVER: "silver", RIM: "silver", COPPER: "copper", GREEN: "green"}
-FILAMENTS = ["dark", "silver", "copper", "green"]
+FILAMENTS = ["dark", "silver", "copper", "green", "gunmetal"]   # gunmetal only with --gunmetal filament
 
-PREVIEW_RGB = {FIELD: (28, 28, 30), GUNMETAL: (62, 62, 66), INK: (10, 10, 10),
+PREVIEW_RGB = {FIELD: (28, 28, 30), GUNMETAL: (98, 98, 104), INK: (10, 10, 10),
                SILVER: (200, 202, 206), RIM: (225, 226, 230),
                COPPER: (214, 128, 84), GREEN: (140, 230, 40)}
 
@@ -74,25 +77,58 @@ def rectify(name):
     return cv2.warpPerspective(src, hm, (W, H), flags=cv2.INTER_CUBIC)
 
 
-def classify(rgb):
-    smooth = cv2.medianBlur(cv2.bilateralFilter(rgb, 9, 40, 7), 5)
-    hsv = cv2.cvtColor(smooth, cv2.COLOR_RGB2HSV).astype(np.int16)
-    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
-    lab = np.full(rgb.shape[:2], FIELD, np.uint8)
-    lab[(v >= 66) & (v <= 115)] = GUNMETAL
-    lab[v > 115] = SILVER
-    lab[(h >= 3) & (h <= 20) & (s > 70) & (v > 90)] = COPPER
-    lab[(h >= 28) & (h <= 50) & (s > 90) & (v > 90)] = GREEN
-    return lab
+def flatten(rgb):
+    """L0 gradient smoothing: removes the render's metal texture and lighting noise while
+    keeping facet edges and grooves sharp, so each facet becomes one flat colour."""
+    return cv2.ximgproc.l0Smooth(rgb, None, 0.01, 2.0)
+
+
+def classify(flat):
+    """Material class per pixel of the flattened render, from CIELAB lightness and hue."""
+    lab = cv2.cvtColor(flat, cv2.COLOR_RGB2LAB).astype(np.int16)
+    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    out = np.full(flat.shape[:2], FIELD, np.uint8)         # background and grooves (L < 70)
+    out[L >= 70] = GUNMETAL                                # darker metal (~L 86)
+    out[L >= 125] = SILVER                                 # bright metal and bevel highlights
+    out[(a >= 140) & (b >= 143) & (L >= 75)] = COPPER
+    out[(a <= 124) & (b >= 146) & (L >= 90)] = GREEN          # incl. near-white glow cores
+    return out
+
+
+def find_dark_feathers(src, flat, mm_px):
+    """Darkest gunmetal feathers flatten to the same lightness as the background (L ~56), so
+    find them by context: compact regions enclosed by grooves and bevel highlights, lying on
+    the eagle, away from the outer frame. Long thin arcs (the dial ring) fail the solidity test."""
+    lab = cv2.cvtColor(flat, cv2.COLOR_RGB2LAB).astype(np.int16)
+    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    v = cv2.cvtColor(src, cv2.COLOR_RGB2HSV)[..., 2].astype(np.float32)
+    eagle = cv2.GaussianBlur(v, (0, 0), 4) > 64
+    bound = (L < 38) | (L >= 125) | ((a >= 140) & (b >= 143)) | ((a <= 124) & (b >= 146))
+    bound = cv2.dilate(bound.astype(np.uint8), np.ones((3, 3), np.uint8))
+    n, cc, st, cen = cv2.connectedComponentsWithStats(1 - bound, connectivity=4)
+    edge_dist = cv2.distanceTransform(hex_mask(R_PX).astype(np.uint8), cv2.DIST_L2, 5)
+    keep = []
+    for i in range(1, n):
+        area = st[i, cv2.CC_STAT_AREA]
+        if not 0.3 <= area / mm_px ** 2 <= 40:
+            continue
+        x, y, w, h = st[i, :4]
+        m = cc[y:y + h, x:x + w] == i
+        if eagle[y:y + h, x:x + w][m].mean() < 0.5:
+            continue
+        pts = np.c_[np.nonzero(m)[1] + x, np.nonzero(m)[0] + y].astype(np.int32)
+        solidity = area / max(cv2.contourArea(cv2.convexHull(pts)), 1)
+        length = max(cv2.minAreaRect(pts)[1]) / mm_px
+        if solidity >= 0.7 and length <= 24 and edge_dist[int(cen[i][1]), int(cen[i][0])] >= 4.5 * mm_px:
+            keep.append(i)
+    feathers = np.isin(cc, keep)
+    # regrow by the sealing dilation so the feather meets its groove/highlight
+    grown = cv2.dilate(feathers.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    return grown & (L < 125)
 
 
 def majority(lab, k, classes):
     votes = np.stack([cv2.blur((lab == c).astype(np.float32), (k, k)) for c in classes])
-    return np.asarray(classes, np.uint8)[votes.argmax(0)]
-
-
-def soft_majority(lab, sigma, classes):
-    votes = np.stack([cv2.GaussianBlur((lab == c).astype(np.float32), (0, 0), sigma) for c in classes])
     return np.asarray(classes, np.uint8)[votes.argmax(0)]
 
 
@@ -223,6 +259,9 @@ def rotated_box(centre, angle, size):
 TAGLINE = ("DRONE AS FIRST RESPONDER", (267, 834, 1087, 877))   # text, x0 y0 x1 y1 of the caps
 
 
+CROSSHAIR_X, CROSSHAIR_Y = 678, [(140, 400), (902, 1025)]   # side B vertical crosshair, px
+
+
 def reletter_tagline(lab):
     """Redraw the copper tagline: the traced D reads as an O and a radar line cuts the N."""
     text, (x0, y0, x1, y1) = TAGLINE
@@ -326,66 +365,31 @@ def label_side(name, args):
     """Classified, cleaned label map for one face (unmirrored, as seen)."""
     mm_px = 2 * R_PX / args.size                            # raster pixels per mm
     min_px = args.min_feature * mm_px
-    if name == "side_b_dfrx":
-        # clean line-art face: its radar rings fade in places in the render, and processing at a
-        # 0.38 mm line bridges those stretches; finer settings only turn the rings into dashes
-        min_px = max(min_px, 0.38 * mm_px)
     src = rectify(name)
-    lab = classify(src)
-
-    # smooth class boundaries (Gaussian-weighted majority vote) so metal texture does not leave
-    # ragged edges, then drop specks below the printable minimum
-    lab = soft_majority(lab, 1.3, [FIELD, SILVER, COPPER, GREEN, GUNMETAL])
-    for cls in (SILVER, COPPER, GREEN, FIELD):
+    flat = flatten(src)
+    lab = classify(flat)
+    if name == "side_a_eagle":
+        lab[find_dark_feathers(src, flat, mm_px) & (lab == FIELD)] = GUNMETAL
+    lab = majority(lab, 3, [FIELD, SILVER, COPPER, GREEN, GUNMETAL])
+    for cls in (SILVER, COPPER, GREEN, GUNMETAL, FIELD):
         lab = drop_specks(lab, cls, min_px ** 2, None)
 
-    if name == "side_a_eagle":
-        # the eagle's faceted feathers need outline and second-metal recovery; the dFRX face is
-        # clean line-work that these filters would break up
-        # recover the dark outlines between facets: the render shades them as narrow grooves that
-        # colour thresholds miss, so find narrow dark features with a black-top-hat filter
-        grey = cv2.cvtColor(cv2.bilateralFilter(src, 7, 30, 5), cv2.COLOR_RGB2GRAY)
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-        lines = (cv2.morphologyEx(grey, cv2.MORPH_BLACKHAT, k) > 30) & (grey < 130)
-        n, cc, st, _ = cv2.connectedComponentsWithStats(lines.astype(np.uint8), connectivity=8)
-        lines &= np.isin(cc, np.where(st[:, cv2.CC_STAT_AREA] >= 3 * min_px ** 2)[0][1:])
-        lab[lines & np.isin(lab, (SILVER, GUNMETAL, COPPER))] = FIELD
-
-        # dark "gunmetal" feathers are only ~15 grey levels above the background, so find them as
-        # metal (heavily smoothed brightness) that is neither silver, copper, green nor an outline
-        v = cv2.cvtColor(src, cv2.COLOR_RGB2HSV)[..., 2].astype(np.float32)
-        metal = cv2.GaussianBlur(v, (0, 0), 4) > 64
-        gm = metal & np.isin(lab, (FIELD, GUNMETAL)) & ~lines
-        gm = cv2.morphologyEx(gm.astype(np.uint8), cv2.MORPH_OPEN,
-                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))).astype(bool)
-        n, cc, st, _ = cv2.connectedComponentsWithStats(gm.astype(np.uint8), connectivity=4)
-        gm = np.isin(cc, np.where(st[:, cv2.CC_STAT_AREA] >= (1.0 * mm_px) ** 2)[0][1:])
-        lab[lab == GUNMETAL] = FIELD
-        if args.gunmetal == "silver":
-            lab[gm] = SILVER
-        else:
-            # a flat face cannot show a second metal tone: print the feather dark with a silver
-            # edge, as the render's bevel highlight reads
-            ring_px = max(min_px, 0.3 * mm_px)
-            core = cv2.erode(gm.astype(np.uint8), cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE, (int(2 * ring_px) | 1, int(2 * ring_px) | 1))).astype(bool)
-            lab[gm & ~core] = SILVER
-
-    else:
-        n, cc, st, _ = cv2.connectedComponentsWithStats((lab == GUNMETAL).astype(np.uint8),
-                                                        connectivity=4)
-        big = np.isin(cc, np.where(st[:, cv2.CC_STAT_AREA] >= (1.2 * mm_px) ** 2)[0][1:])
-        lab[(lab == GUNMETAL) & big] = SILVER
-        lab[lab == GUNMETAL] = FIELD
+    if name == "side_b_dfrx":
+        # on this face the mid-grey pixels are the dimmer stretches of the silver radar lines
+        lab[lab == GUNMETAL] = SILVER
+    elif args.gunmetal == "silver":
+        lab[lab == GUNMETAL] = SILVER
+    elif args.gunmetal == "dark":
+        lab[lab == GUNMETAL] = FIELD                        # silver bevel edges outline them
 
     # widen hairlines to the printable minimum: isolated light strokes first, then the dark
     # outlines between facets (dark wins, so facets stay separated)
-    for cls in (COPPER, GREEN, SILVER):
+    for cls in (COPPER, GREEN, SILVER, GUNMETAL):
         grow = thicken(lab == cls, min_px) & (lab == FIELD)
         lab[grow] = cls
     dark = lab == FIELD
     lab[thicken_lines(dark, min_px) & ~dark] = FIELD
-    for cls in (SILVER, COPPER, GREEN):                     # sub-minimum slivers left behind
+    for cls in (SILVER, COPPER, GREEN, GUNMETAL):           # sub-minimum slivers left behind
         lab = drop_specks(lab, cls, (0.8 * min_px) ** 2, FIELD)
 
     # lettering is redrawn from a font last so nothing above erodes it
@@ -400,6 +404,11 @@ def label_side(name, args):
         lab[(lab == COPPER) & ~text] = SILVER
         lab = reletter_numbers(lab)
         lab = reletter_tagline(lab)
+        # the vertical crosshair is a glowing green bar whose near-white core reads as silver in
+        # places: draw it as an exact straight bar
+        half = max(3.0, min_px / 2)
+        for y0, y1 in CROSSHAIR_Y:
+            lab[y0:y1, int(round(CROSSHAIR_X - half)):int(round(CROSSHAIR_X + half)) + 1] = GREEN
 
     # geometric rim + clean groove inside it, clip to hexagon
     rim_px = args.rim * mm_px
@@ -420,12 +429,13 @@ def label_side(name, args):
 
 
 def face_sections(lab, args, mirror):
-    """Disjoint silver / copper / green cross-sections (mm) for one face."""
+    """Disjoint silver / copper / green (/ gunmetal) cross-sections (mm) for one face."""
     px_mm = args.size / (2 * R_PX)
     hexsec = hex_cs(args.size / 2)
     taken = m3d.CrossSection()
     out = {}
-    for f, classes in (("silver", (SILVER, RIM)), ("copper", (COPPER,)), ("green", (GREEN,))):
+    for f, classes in (("silver", (SILVER, RIM)), ("copper", (COPPER,)), ("green", (GREEN,)),
+                       ("gunmetal", (GUNMETAL,))):
         sec = clean((mask_to_cs(np.isin(lab, classes), px_mm) ^ hexsec) - taken)
         taken = taken + sec
         out[f] = sec.mirror((1, 0)) if mirror else sec
@@ -484,7 +494,7 @@ def export(parts, out_dir, stem):
     scene = trimesh.Scene()
     for f, tm in meshes.items():
         scene.add_geometry(tm, node_name=f, geom_name=f)
-    scene.export(os.path.join(out_dir, f"{stem}_4colour.3mf"))
+    scene.export(os.path.join(out_dir, f"{stem}_{len(meshes)}colour.3mf"))
     return stats
 
 
@@ -497,8 +507,9 @@ def main():
     ap.add_argument("--rim", type=float, default=1.8, help="rim width, mm")
     ap.add_argument("--min-feature", type=float, default=0.38,
                     help="thinnest printable stroke, mm (0.38 for a 0.4 nozzle, 0.22 for 0.2)")
-    ap.add_argument("--gunmetal", choices=("silver", "outline"), default="silver",
-                    help="dark feathers: solid silver, or dark with a silver edge")
+    ap.add_argument("--gunmetal", choices=("dark", "silver", "filament"), default="dark",
+                    help="darker-metal feathers: print silver, print dark (their silver bevel "
+                         "edges outline them), or as a 5th filament")
     ap.add_argument("--out", default=os.path.join(ROOT, "stl", "nozzle_0.4"))
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
