@@ -5,9 +5,10 @@ Pipeline per side:
   2. Flatten the render with L0 gradient smoothing (texture and lighting noise go, facet edges
      stay sharp), then classify each pixel by CIELAB lightness/hue: field, gunmetal, silver,
      copper, green. Side A: recover the darkest feathers by context (enclosed compact regions).
-  3. Redraw lettering from fonts (fixing the "SECONOS" typo), the eagle's eye and side B's
-     crosshair as exact geometry.
-  4. Replace the rendered rim with a clean geometric rim.
+  3. Keep the render's own lettering (lettering zones get only fine clean-up) and correct the
+     "SECONOS" typo by turning the misspelt O into a D in the same typeface; draw side B's gem
+     and crosshair as exact geometry; dark-metal feathers become fine grey hatching.
+  4. Replace the rendered rim with a clean geometric rim measured from the render.
   5. Clean up: majority filter, drop specks, thicken hairlines to the printable minimum.
   6. Vectorise each colour and cut it out of the coin body as a flat inlay.
 
@@ -25,7 +26,7 @@ import cv2
 import numpy as np
 import manifold3d as m3d
 import trimesh
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from skimage.morphology import skeletonize
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -46,17 +47,15 @@ SRC_CORNERS = {
 FIELD, SILVER, COPPER, GREEN, GUNMETAL, RIM, INK = range(7)
 
 # filament each class is printed in
-FILAMENT = {FIELD: "dark", GUNMETAL: "gunmetal", INK: "dark",
-            SILVER: "silver", RIM: "silver", COPPER: "copper", GREEN: "green"}
-FILAMENTS = ["dark", "silver", "copper", "green", "gunmetal"]   # gunmetal only with --gunmetal filament
+# the four filaments: black, grey (the render's silver metal), copper and neon green
+FILAMENT = {FIELD: "black", GUNMETAL: "gunmetal", INK: "black",
+            SILVER: "grey", RIM: "grey", COPPER: "copper", GREEN: "green"}
+FILAMENTS = ["black", "grey", "copper", "green", "gunmetal"]    # gunmetal only with --gunmetal filament
 
-PREVIEW_RGB = {FIELD: (28, 28, 30), GUNMETAL: (98, 98, 104), INK: (10, 10, 10),
-               SILVER: (200, 202, 206), RIM: (225, 226, 230),
-               COPPER: (214, 128, 84), GREEN: (140, 230, 40)}
+GREY_RGB = (182, 185, 190)
+PREVIEW_RGB = {FIELD: (24, 24, 26), GUNMETAL: (98, 98, 104), INK: (24, 24, 26),
+               SILVER: GREY_RGB, RIM: GREY_RGB, COPPER: (196, 112, 64), GREEN: (120, 255, 20)}
 
-MOTTO = "FASTER RESPONSE WHEN SECONDS MATTER"
-FONT_DIR = "/usr/share/fonts/opentype/inter"
-FONT = f"{FONT_DIR}/Inter-Black.otf"            # set in main(): lighter weight for fine nozzles
 
 
 def hex_pts(r, cx=CX, cy=CY):
@@ -88,8 +87,8 @@ def classify(flat):
     lab = cv2.cvtColor(flat, cv2.COLOR_RGB2LAB).astype(np.int16)
     L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
     out = np.full(flat.shape[:2], FIELD, np.uint8)         # background and grooves (L < 70)
-    out[L >= 70] = GUNMETAL                                # darker metal (~L 86)
-    out[L >= 125] = SILVER                                 # bright metal and bevel highlights
+    out[L >= 70] = GUNMETAL                                # dark metal feathers (L 70-100)
+    out[L >= 100] = SILVER                                 # metal incl. shaded sides (tail, talons)
     out[(a >= 140) & (b >= 143) & (L >= 75)] = COPPER
     out[(a <= 124) & (b >= 146) & (L >= 90)] = GREEN          # incl. near-white glow cores
     return out
@@ -125,6 +124,30 @@ def find_dark_feathers(src, flat, mm_px):
     # regrow by the sealing dilation so the feather meets its groove/highlight
     grown = cv2.dilate(feathers.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
     return grown & (L < 125)
+
+
+def hatch_gunmetal(lab, line_px, pitch_px):
+    """Engraver's hatching: render each dark-metal feather as fine grey lines on black, run along
+    the feather's long axis, so with four filaments it still reads as a darker metal tone."""
+    lab = lab.copy()
+    n, cc, st, _ = cv2.connectedComponentsWithStats((lab == GUNMETAL).astype(np.uint8), connectivity=8)
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    for i in range(1, n):
+        x, y, w, h, area = st[i]
+        m = cc[y:y + h, x:x + w] == i
+        pts = np.c_[np.nonzero(m)[1] + x, np.nonzero(m)[0] + y].astype(np.float32)
+        if area < 30:
+            lab[y:y + h, x:x + w][m] = FIELD
+            continue
+        mean = pts.mean(0)
+        vec = np.linalg.svd(pts - mean, full_matrices=False)[2]
+        nx, ny = vec[1]                                     # normal to the long axis
+        d = (xx[y:y + h, x:x + w] - mean[0]) * nx + (yy[y:y + h, x:x + w] - mean[1]) * ny
+        stripe = np.mod(d + line_px / 2, pitch_px) < line_px
+        sub = lab[y:y + h, x:x + w]
+        sub[m & stripe] = SILVER
+        sub[m & ~stripe] = FIELD
+    return lab
 
 
 def majority(lab, k, classes):
@@ -184,62 +207,62 @@ def band_mask(rin, rout, a0, a1, pad=0):
     return (ang >= a0) & (ang <= a1) & (rad >= rin(ang) + pad) & (rad <= rout(ang) - pad)
 
 
-def reletter_motto(lab):
-    rin, rout = band_profile()
-    a0, a1 = -123.0, 6.0                                    # angular span carrying the old lettering
-    band = band_mask(rin, rout, a0, a1, pad=6)
-    lab = lab.copy()
-    lab[band & (lab != SILVER)] = SILVER                    # wipe the old (misspelt) lettering
-
-    # render the motto along the band centreline, one glyph at a time
-    mid = lambda a: (rin(a) + rout(a)) / 2
-    width = np.mean([rout(a) - rin(a) for a in np.linspace(-110, 0, 20)])
-    print(f"  motto band width {width:.0f}px")
-    r_mid = mid(-60.0)
-    span = 124.0                                            # degrees the original lettering covers
-    condense = 0.80                                         # original face is a semi-condensed sans
-    scale = 4                                               # supersample for clean glyph edges
-    probe = ImageFont.truetype(FONT, 100)
-    track = 0.07                                            # extra letter spacing, em (keeps gaps printable)
-    em_len = sum(probe.getlength(ch) / 100 * condense + track for ch in MOTTO)
-    em = min(np.radians(span) * r_mid / em_len, 0.66 * width / 0.727)   # Inter cap height ~0.727 em
-    font = ImageFont.truetype(FONT, int(em * scale))
-    adv = [font.getlength(ch) / scale * condense + track * em for ch in MOTTO]
-    start = -60.0 - np.degrees(sum(adv) / r_mid) / 2       # centred where the original was
-    ink = Image.new("L", (W * scale, H * scale), 0)
-    pos = 0.0
-    for ch, w in zip(MOTTO, adv):
-        a = start + np.degrees((pos + w / 2) / r_mid)
-        pos += w
-        if ch == " ":
-            continue
-        r = mid(a)
-        gx, gy = BAND_C[0] + r * np.cos(np.radians(a)), BAND_C[1] + r * np.sin(np.radians(a))
-        g = Image.new("L", (int(w * scale / condense * 2) + 20, int(em * scale * 1.6)), 0)
-        ImageDraw.Draw(g).text((g.width / 2, g.height / 2), ch, font=font, fill=255, anchor="mm")
-        g = g.resize((int(g.width * condense), g.height), Image.LANCZOS)
-        g = g.rotate(-(a + 90), resample=Image.BICUBIC, expand=True)
-        ink.paste(g, (int(gx * scale - g.width / 2), int(gy * scale - g.height / 2)), g)
-    ink = np.array(ink.resize((W, H), Image.LANCZOS)) > 110
-    lab[ink & band_mask(rin, rout, a0, a1, pad=2)] = INK
-    return lab
+EYE_LID = ((1063, 623), (1099, 668), 5.0)   # lid-line segment under the brow (px), half-width
 
 
-EYE_C, EYE_R = (1052, 647), 21          # eagle's eye in the rectified raster
-
-
-def redraw_eye(lab, min_px):
-    """The eye's concentric rings are finer than the colour separation resolves: redraw it as a
-    dark-rimmed green iris, dark pupil and a silver catch-light."""
+def eye_lid_line(flat):
+    """The dark-green lid line under the brow has the same tone as the dark ring inside the iris,
+    so take dark green as green only along the lid segment."""
+    lab = cv2.cvtColor(flat, cv2.COLOR_RGB2LAB).astype(np.int16)
+    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    (x0, y0), (x1, y1), half = EYE_LID
     yy, xx = np.mgrid[0:H, 0:W]
-    r = np.hypot(xx - EYE_C[0], yy - EYE_C[1])
+    d = np.array([x1 - x0, y1 - y0], float)
+    t = np.clip(((xx - x0) * d[0] + (yy - y0) * d[1]) / (d @ d), 0, 1)
+    dist = np.hypot(xx - (x0 + t * d[0]), yy - (y0 + t * d[1]))
+    return (dist <= half) & (a <= 116) & (b >= 140) & (L >= 40)
+
+
+MOTTO_TYPO_O = (1036, 309)              # the second O of the render's "SECONOS" (should be D)
+
+
+def fix_motto_typo(lab):
+    """Keep the render's own lettering and correct only "SECONOS" -> "SECONDS": the misspelt O
+    becomes a D in the same typeface (same outline and counter, squared off on the left)."""
     lab = lab.copy()
-    rim = max(3.0, min_px * 0.6)
-    lab[r <= EYE_R + rim] = FIELD
-    lab[r <= EYE_R] = GREEN
-    lab[r <= max(9.0, min_px)] = FIELD
-    glint = max(3.0, min_px / 2)
-    lab[np.hypot(xx - (EYE_C[0] - 2), yy - (EYE_C[1] - 13)) <= glint] = SILVER
+    rin, rout = band_profile()
+    band = band_mask(rin, rout, -128, 8, pad=3)
+    ink = (band & (lab == FIELD)).astype(np.uint8)
+    n, cc, st, cen = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    i = int(np.argmin(np.hypot(cen[1:, 0] - MOTTO_TYPO_O[0], cen[1:, 1] - MOTTO_TYPO_O[1]))) + 1
+    cx, cy = cen[i]
+    o = (cc == i).astype(np.float32)
+    # rotate so the glyph stands upright: its "up" is the outward radial direction
+    phi = np.degrees(np.arctan2(cy - BAND_C[1], cx - BAND_C[0])) + 90
+    size = 96
+    rot = cv2.getRotationMatrix2D((cx, cy), phi, 1.0)
+    rot[:, 2] += (size / 2 - cx, size / 2 - cy)
+    up = cv2.warpAffine(o, rot, (size, size), flags=cv2.INTER_LINEAR) > 0.5
+    ys, xs = np.nonzero(up)
+    u0, u1, v0, v1 = xs.min(), xs.max(), ys.min(), ys.max()
+    filled = up.copy().astype(np.uint8)
+    ff = np.zeros((size + 2, size + 2), np.uint8)
+    cv2.floodFill(filled, ff, (0, 0), 2)
+    outer = filled != 2                                     # glyph plus its counter
+    hole = outer & ~up
+    hy, hx = np.nonzero(hole)
+    um = (u0 + u1) // 2
+    d_outer = outer.copy()
+    d_outer[v0:v1 + 1, u0:um + 1] = True                   # straight stem on the left
+    d_hole = hole.copy()
+    if len(hx):
+        stem = hx.min() - u0                                # keep the O's side-stroke weight
+        d_hole[hy.min():hy.max() + 1, u0 + stem:(hx.min() + hx.max()) // 2 + 1] = True
+    d = (d_outer & ~d_hole).astype(np.float32)
+    back = cv2.invertAffineTransform(rot)
+    d_img = cv2.warpAffine(d, back, (W, H), flags=cv2.INTER_LINEAR) > 0.5
+    lab[cv2.dilate((cc == i).astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool) & band] = SILVER
+    lab[d_img] = FIELD
     return lab
 
 
@@ -260,64 +283,7 @@ TAGLINE = ("DRONE AS FIRST RESPONDER", (267, 834, 1087, 877))   # text, x0 y0 x1
 
 
 CROSSHAIR_X, CROSSHAIR_Y = 678, [(140, 400), (902, 1025)]   # side B vertical crosshair, px
-
-
-def reletter_tagline(lab):
-    """Redraw the copper tagline: the traced D reads as an O and a radar line cuts the N."""
-    text, (x0, y0, x1, y1) = TAGLINE
-    lab = lab.copy()
-    pad = 6
-    lab[y0 - pad:y1 + pad, x0 - pad:x1 + pad] = FIELD
-    scale = 4
-    cap = y1 - y0
-    font = ImageFont.truetype(FONT, int(cap / 0.727 * scale))
-    # the render's face is narrower and more widely spaced than Inter: condense each glyph and
-    # spread the spare width between letters
-    condense = 0.82
-    glyphs = []
-    for ch in text:
-        if ch == " ":
-            glyphs.append(None)
-            continue
-        gi = Image.new("L", (int(cap * scale * 2), int(cap * scale * 1.6)), 0)
-        ImageDraw.Draw(gi).text((gi.width // 2, int(gi.height * 0.8)), ch, font=font, fill=255,
-                                anchor="ms")
-        gi = gi.crop(gi.getbbox())
-        glyphs.append(gi.resize((max(1, int(gi.width * condense)), gi.height), Image.LANCZOS))
-    space = font.getlength(" ") * condense
-    ink_w = sum(gi.width if gi else space for gi in glyphs)
-    gap = ((x1 - x0) * scale - ink_w) / (len(text) - 1)
-    g = Image.new("L", ((x1 - x0) * scale + 50, cap * scale + 50), 0)
-    x = 0.0
-    for gi in glyphs:
-        if gi is None:
-            x += space + gap
-            continue
-        g.paste(gi, (int(x), cap * scale - gi.height + 10))
-        x += gi.width + gap
-    g = g.crop(g.getbbox()).resize(((x1 - x0) * scale, cap * scale), Image.LANCZOS)
-    ink = np.array(g.resize((x1 - x0, cap), Image.LANCZOS)) > 110
-    region = lab[y0:y1, x0:x1]
-    region[ink] = COPPER
-    return lab
-
-
-def reletter_numbers(lab):
-    lab = lab.copy()
-    scale = 4
-    for text, c, ang, cap, wipe in NUMBERS:
-        box = rotated_box(c, ang, wipe)
-        lab[box] = SILVER                                    # the arm is plain silver under the digits
-        font = ImageFont.truetype(FONT, int(cap / 0.727 * scale))
-        g = Image.new("L", (int(font.getlength(text) * 1.3) + 40, int(cap * scale * 2.2)), 0)
-        ImageDraw.Draw(g).text((g.width / 2, g.height / 2), text, font=font, fill=255, anchor="mm")
-        g = g.resize((int(g.width * 0.9), g.height), Image.LANCZOS)
-        g = g.rotate(-ang, resample=Image.BICUBIC, expand=True)
-        ink = Image.new("L", (W * scale, H * scale), 0)
-        ink.paste(g, (int(c[0] * scale - g.width / 2), int(c[1] * scale - g.height / 2)), g)
-        ink = np.array(ink.resize((W, H), Image.LANCZOS)) > 110
-        lab[ink & box] = COPPER
-    return lab
+GEM_BOX = (880, 480, 1020, 620)                         # side B: search box for the X's green gem
 
 
 # --- geometry -------------------------------------------------------------------------------
@@ -368,8 +334,10 @@ def label_side(name, args):
     src = rectify(name)
     flat = flatten(src)
     lab = classify(flat)
+    raw = lab.copy()                                        # before clean-up, for small lettering
     if name == "side_a_eagle":
         lab[find_dark_feathers(src, flat, mm_px) & (lab == FIELD)] = GUNMETAL
+        lab[eye_lid_line(flat)] = GREEN
     lab = majority(lab, 3, [FIELD, SILVER, COPPER, GREEN, GUNMETAL])
     for cls in (SILVER, COPPER, GREEN, GUNMETAL, FIELD):
         lab = drop_specks(lab, cls, min_px ** 2, None)
@@ -377,10 +345,14 @@ def label_side(name, args):
     if name == "side_b_dfrx":
         # on this face the mid-grey pixels are the dimmer stretches of the silver radar lines
         lab[lab == GUNMETAL] = SILVER
-    elif args.gunmetal == "silver":
+    elif args.gunmetal == "grey":
         lab[lab == GUNMETAL] = SILVER
-    elif args.gunmetal == "dark":
-        lab[lab == GUNMETAL] = FIELD                        # silver bevel edges outline them
+    elif args.gunmetal == "black":
+        lab[lab == GUNMETAL] = FIELD                        # grey bevel edges outline them
+    elif args.gunmetal == "hatch":
+        # 40% grey coverage matches the render's dark-metal tone (L ~85 between black ~20 and grey ~185)
+        pitch = args.hatch_pitch or args.min_feature / 0.4
+        lab = hatch_gunmetal(lab, min_px, pitch * mm_px)
 
     # widen hairlines to the printable minimum: isolated light strokes first, then the dark
     # outlines between facets (dark wins, so facets stay separated)
@@ -392,30 +364,97 @@ def label_side(name, args):
     for cls in (SILVER, COPPER, GREEN, GUNMETAL):           # sub-minimum slivers left behind
         lab = drop_specks(lab, cls, (0.8 * min_px) ** 2, FIELD)
 
-    # lettering is redrawn from a font last so nothing above erodes it
+    # lettering keeps the render's own letterforms: its counters and letter gaps (~0.28 mm) are
+    # finer than a 0.4 nozzle's clean-up minimum, so lettering zones get only the fine clean-up
+    # and are left for the slicer's variable-width walls to resolve
+    fine_px = min(min_px, 0.22 * mm_px)
+    fine = majority(raw, 3, [FIELD, SILVER, COPPER, GREEN, GUNMETAL])
+    fine[fine == GUNMETAL] = SILVER if name == "side_b_dfrx" else FIELD
+    for cls in (SILVER, COPPER, FIELD):
+        fine = drop_specks(fine, cls, fine_px ** 2, None)
     if name == "side_a_eagle":
-        lab = reletter_motto(lab)
-        lab = redraw_eye(lab, min_px)
+        rin, rout = band_profile()
+        zone = band_mask(rin, rout, -128, 8, pad=4)
+        fine[zone & (fine == FIELD) & (raw == GUNMETAL)] = SILVER   # shaded band, not ink
+    else:
+        x0, y0, x1, y1 = TAGLINE[1]
+        zone = np.zeros_like(lab, bool)
+        zone[y0 - 6:y1 + 6, x0 - 6:x1 + 6] = True
+    lab[zone] = fine[zone]
+
+    if name == "side_a_eagle":
+        lab = fix_motto_typo(lab)
+        # (eye is traced like the rest of the face: its almond socket and C-shaped iris ring are
+        #  resolved by the flattened classification)
     else:
         # copper on this face is lettering only; other copper pixels are bronze reflections on
         # the silver radar lines in the render
-        text = np.zeros_like(lab, bool)
-        text[815:900, :] = True                             # DRONE AS FIRST RESPONDER
+        x0, y0, x1, y1 = TAGLINE[1]
+        tag = np.zeros_like(lab, bool)
+        tag[y0 - 8:y1 + 8, x0 - 8:x1 + 8] = True
+        text = tag.copy()
+        for _, c, ang, _, wipe in NUMBERS:
+            text |= rotated_box(c, ang, wipe)
         lab[(lab == COPPER) & ~text] = SILVER
-        lab = reletter_numbers(lab)
-        lab = reletter_tagline(lab)
+        # the render's own lettering is kept; inside the tagline the grey pixels are bevel
+        # highlights on the copper letters, so they print copper
+        hi = (lab == SILVER) & tag
+        near = cv2.dilate((lab == COPPER).astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+        lab[hi & near] = COPPER
+        # 000 / 131444 are engraved: copper with a dark edge, each stroke ~0.4 mm in all, too narrow
+        # for a printable copper core and dark edge both, so each traced digit prints solid copper
+        # (traced from the unfiltered classification: clean-up would fill the 4s' small counters)
+        cross = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+        for _, c, ang, _, wipe in NUMBERS:
+            box = rotated_box(c, ang, wipe)
+            digit = (box & np.isin(raw, (COPPER, FIELD, GUNMETAL))).astype(np.uint8)
+            digit = cv2.morphologyEx(digit, cv2.MORPH_CLOSE, cross)
+            # fill pinholes, keep real counters
+            n, cc, st, _ = cv2.connectedComponentsWithStats(1 - digit, connectivity=4)
+            for k in range(1, n):
+                if st[k, cv2.CC_STAT_AREA] < 12:
+                    digit[cc == k] = 1
+            digit = cv2.erode(digit, cross) * box.astype(np.uint8)
+            # drop copper bevel reflections at the arm's ends: real digits are larger
+            n, cc, st, _ = cv2.connectedComponentsWithStats(digit, connectivity=8)
+            digit = np.isin(cc, [k for k in range(1, n) if st[k, cv2.CC_STAT_AREA] >= 150])
+            digit = thicken(digit, min_px) & box            # strokes to the printable minimum
+            lab[box & (lab != GREEN)] = SILVER
+            lab[digit] = COPPER
         # the vertical crosshair is a glowing green bar whose near-white core reads as silver in
         # places: draw it as an exact straight bar
+        # the X's centre is a square green gem: replace the traced blob with an exact quadrilateral
+        gem = np.zeros_like(lab, np.uint8)
+        gem[GEM_BOX[1]:GEM_BOX[3], GEM_BOX[0]:GEM_BOX[2]] = lab[GEM_BOX[1]:GEM_BOX[3],
+                                                               GEM_BOX[0]:GEM_BOX[2]] == GREEN
+        n, cc, st, _ = cv2.connectedComponentsWithStats(gem, connectivity=8)
+        if n > 1:
+            big = 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
+            pts = np.c_[np.nonzero(cc == big)[1], np.nonzero(cc == big)[0]].astype(np.int32)
+            hull = cv2.convexHull(pts)
+            quad = cv2.approxPolyDP(hull, 0.04 * cv2.arcLength(hull, True), True)
+            if len(quad) != 4:
+                quad = np.int32(cv2.boxPoints(cv2.minAreaRect(pts)))
+            ring = np.zeros_like(gem)
+            cv2.fillPoly(ring, [quad.reshape(-1, 2)], 1)
+            grown = cv2.dilate(ring, np.ones((int(min_px) | 1, int(min_px) | 1), np.uint8))
+            lab[(grown > 0) & (ring == 0) & (lab != SILVER)] = FIELD     # dark setting round the gem
+            lab[(cc == big) & (ring == 0)] = FIELD
+            lab[ring > 0] = GREEN
         half = max(3.0, min_px / 2)
         for y0, y1 in CROSSHAIR_Y:
             lab[y0:y1, int(round(CROSSHAIR_X - half)):int(round(CROSSHAIR_X + half)) + 1] = GREEN
 
-    # geometric rim + clean groove inside it, clip to hexagon
+    # geometric rim, measured from the render: a dark outer bevel edge, the grey rim band out to
+    # --rim from the edge, then a dark groove; clip to the hexagon
+    k = 2 / np.sqrt(3)                                      # across-flats inset -> circumradius
     rim_px = args.rim * mm_px
-    inner = hex_mask(R_PX - rim_px * 2 / np.sqrt(3))
-    groove = inner & ~hex_mask(R_PX - (rim_px + min_px) * 2 / np.sqrt(3))
+    edge_px = max(args.rim_edge, args.min_feature) * mm_px
+    inner = hex_mask(R_PX - rim_px * k)
+    groove = inner & ~hex_mask(R_PX - (rim_px + min_px) * k)
     lab[groove] = FIELD
     lab[hex_mask(R_PX) & ~inner] = RIM
+    lab[hex_mask(R_PX) & ~hex_mask(R_PX - edge_px * k)] = FIELD
     lab[~hex_mask(R_PX)] = 255
 
     prev = np.full((H, W, 3), 255, np.uint8)
@@ -434,7 +473,7 @@ def face_sections(lab, args, mirror):
     hexsec = hex_cs(args.size / 2)
     taken = m3d.CrossSection()
     out = {}
-    for f, classes in (("silver", (SILVER, RIM)), ("copper", (COPPER,)), ("green", (GREEN,)),
+    for f, classes in (("grey", (SILVER, RIM)), ("copper", (COPPER,)), ("green", (GREEN,)),
                        ("gunmetal", (GUNMETAL,))):
         sec = clean((mask_to_cs(np.isin(lab, classes), px_mm) ^ hexsec) - taken)
         taken = taken + sec
@@ -470,16 +509,21 @@ def assemble(body, hexsec, thickness, inlays):
     for secs, z0, z1 in inlays:
         colour = m3d.CrossSection.batch_boolean([s for s in secs.values() if s.area() > 0],
                                                 m3d.OpType.Add)
-        secs = dict(secs, dark=clean(hexsec - colour))
+        secs = dict(secs, black=clean(hexsec - colour))
         for f, sec in secs.items():
             if sec.area() > 0:
-                parts[f].append(m3d.Manifold.extrude(sec, z1 - z0).translate((0, 0, z0)) ^ body)
+                # black inlay pieces reach 0.01 mm into the black core so they fuse with it
+                # volumetrically; face-to-face contact along the coin edge leaves non-manifold edges
+                a, b = (z0, z1 + 0.01) if z0 <= 0 else (z0 - 0.01, z1)
+                if f != "black":
+                    a, b = z0, z1
+                parts[f].append(m3d.Manifold.extrude(sec, b - a).translate((0, 0, a)) ^ body)
         if z0 <= 0:
             core0 = z1
         else:
             core1 = z0
     slab = m3d.Manifold.extrude(hexsec, core1 - core0).translate((0, 0, core0))
-    parts["dark"].append(slab ^ body)
+    parts["black"].append(slab ^ body)
     return {f: m3d.Manifold.batch_boolean(parts[f], m3d.OpType.Add) for f in FILAMENTS if parts[f]}
 
 
@@ -504,19 +548,19 @@ def main():
     ap.add_argument("--thickness", type=float, default=3.4, help="finished coin thickness, mm")
     ap.add_argument("--inlay", type=float, default=0.6, help="colour inlay depth per face, mm")
     ap.add_argument("--chamfer", type=float, default=0.4, help="45-degree edge chamfer, mm")
-    ap.add_argument("--rim", type=float, default=1.8, help="rim width, mm")
+    ap.add_argument("--rim", type=float, default=2.05, help="rim inner edge, mm from the coin edge")
+    ap.add_argument("--rim-edge", type=float, default=0.35, help="dark outer bevel edge of the rim, mm")
     ap.add_argument("--min-feature", type=float, default=0.38,
                     help="thinnest printable stroke, mm (0.38 for a 0.4 nozzle, 0.22 for 0.2)")
-    ap.add_argument("--gunmetal", choices=("dark", "silver", "filament"), default="dark",
-                    help="darker-metal feathers: print silver, print dark (their silver bevel "
-                         "edges outline them), or as a 5th filament")
+    ap.add_argument("--gunmetal", choices=("hatch", "black", "grey", "filament"), default="hatch",
+                    help="darker-metal feathers: fine grey hatching on black (reads as dark metal), "
+                         "solid black (grey bevel edges outline them), solid grey, or a 5th filament")
+    ap.add_argument("--hatch-pitch", type=float, default=None,
+                    help="line spacing for --gunmetal hatch, mm (default: 40%% grey coverage; "
+                         "grey line = --min-feature wide)")
     ap.add_argument("--out", default=os.path.join(ROOT, "stl", "nozzle_0.4"))
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
-    global FONT
-    # a fine nozzle can hold the source's lighter letter weight; a 0.4 needs the heavier one
-    FONT = f"{FONT_DIR}/Inter-{'ExtraBold' if args.min_feature < 0.3 else 'Black'}.otf"
-
     lab_a = label_side("side_a_eagle", args)
     lab_b = label_side("side_b_dfrx", args)
     r, t, d, c = args.size / 2, args.thickness, args.inlay, args.chamfer

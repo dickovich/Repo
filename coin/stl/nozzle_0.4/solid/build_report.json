@@ -1,0 +1,79 @@
+{
+  "coin_one_piece": {
+    "black": {
+      "triangles": 57248,
+      "volume_mm3": 6845.7,
+      "watertight": true
+    },
+    "grey": {
+      "triangles": 51486,
+      "volume_mm3": 943.7,
+      "watertight": true
+    },
+    "copper": {
+      "triangles": 10672,
+      "volume_mm3": 89.8,
+      "watertight": true
+    },
+    "green": {
+      "triangles": 4352,
+      "volume_mm3": 47.4,
+      "watertight": true
+    }
+  },
+  "half_a_eagle": {
+    "black": {
+      "triangles": 35398,
+      "volume_mm3": 3414.9,
+      "watertight": true
+    },
+    "grey": {
+      "triangles": 32404,
+      "volume_mm3": 464.7,
+      "watertight": true
+    },
+    "copper": {
+      "triangles": 7096,
+      "volume_mm3": 65.3,
+      "watertight": true
+    },
+    "green": {
+      "triangles": 2204,
+      "volume_mm3": 18.7,
+      "watertight": true
+    }
+  },
+  "half_b_dfrx": {
+    "black": {
+      "triangles": 21870,
+      "volume_mm3": 3430.8,
+      "watertight": true
+    },
+    "grey": {
+      "triangles": 19064,
+      "volume_mm3": 479.1,
+      "watertight": true
+    },
+    "copper": {
+      "triangles": 3576,
+      "volume_mm3": 24.4,
+      "watertight": true
+    },
+    "green": {
+      "triangles": 2148,
+      "volume_mm3": 28.7,
+      "watertight": true
+    }
+  },
+  "params": {
+    "size": 60.0,
+    "thickness": 3.4,
+    "inlay": 0.6,
+    "chamfer": 0.4,
+    "rim": 2.05,
+    "rim_edge": 0.35,
+    "min_feature": 0.38,
+    "gunmetal": "black",
+    "hatch_pitch": null
+  }
+}

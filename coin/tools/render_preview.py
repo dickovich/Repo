@@ -10,8 +10,8 @@ import trimesh
 from PIL import Image
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-COLOURS = {"dark": (0.17, 0.17, 0.18), "silver": (0.80, 0.81, 0.83),
-           "copper": (0.82, 0.48, 0.30), "green": (0.55, 0.92, 0.15),
+COLOURS = {"black": (0.094, 0.094, 0.10), "grey": (0.71, 0.725, 0.745),
+           "copper": (0.77, 0.44, 0.25), "green": (0.47, 1.0, 0.08),
            "gunmetal": (0.40, 0.40, 0.42)}
 LIGHT = np.array([-0.25, 0.35, 0.90])                # near face-on, as a coin is viewed
 LIGHT /= np.linalg.norm(LIGHT)
