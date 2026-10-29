@@ -2,23 +2,23 @@
 {
   "coin_one_piece": {
     "dark": {
-      "triangles": 42518,
-      "volume_mm3": 6884.5,
+      "triangles": 41862,
+      "volume_mm3": 6889.6,
       "watertight": true
     },
     "silver": {
-      "triangles": 36414,
-      "volume_mm3": 899.8,
+      "triangles": 35586,
+      "volume_mm3": 891.2,
       "watertight": true
     },
     "copper": {
-      "triangles": 7792,
-      "volume_mm3": 101.3,
+      "triangles": 7192,
+      "volume_mm3": 104.4,
       "watertight": true
     },
     "green": {
       "triangles": 3788,
-      "volume_mm3": 39.8,
+      "volume_mm3": 40.3,
       "watertight": true
     }
   },
@@ -46,23 +46,23 @@
   },
   "half_b_dfrx": {
     "dark": {
-      "triangles": 15312,
-      "volume_mm3": 3466.0,
+      "triangles": 14656,
+      "volume_mm3": 3471.1,
       "watertight": true
     },
     "silver": {
-      "triangles": 13570,
-      "volume_mm3": 447.9,
+      "triangles": 12742,
+      "volume_mm3": 439.2,
       "watertight": true
     },
     "copper": {
-      "triangles": 3812,
-      "volume_mm3": 27.3,
+      "triangles": 3212,
+      "volume_mm3": 30.4,
       "watertight": true
     },
     "green": {
       "triangles": 1680,
-      "volume_mm3": 21.1,
+      "volume_mm3": 21.6,
       "watertight": true
     }
   },

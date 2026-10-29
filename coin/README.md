@@ -54,6 +54,8 @@ Each set has one STL per filament, all on the same origin, plus a `_4colour.3mf`
 
 - **Motto spelling fixed.** The source render reads "SECON**O**S". The lettering is redrawn from a font (Inter Black) so it reads **"SECONDS"**.
 - **000 / 131444 redrawn** from a font for clean edges.
+- **"DRONE AS FIRST RESPONDER" redrawn** from a font: narrowed glyphs, spaced to the original's width. In the traced version the D read as an O and a radar line cut through the N.
+- **Side B is processed at a 0.38 mm line in both builds.** It's clean line art: its radar rings fade in places in the render, and a 0.38 mm line bridges those gaps where finer settings break the rings into dashes. The 0.2 mm build's extra detail goes into the eagle face.
 - **Rim redrawn** as a clean hexagon.
 - **Two metal tones become one.** A flat face can't show the render's gunmetal tone, so the dark feathers print silver. They're found by heavily smoothed brightness, because they're only about 15 grey levels above the background. The dark outlines around each feather keep the facets distinct. `--gunmetal outline` prints them dark with a silver edge instead.
 - **Facet outlines recovered.** The render draws the outlines between facets as shaded grooves, which colour alone misses. A black-top-hat filter finds them so they print as dark lines.

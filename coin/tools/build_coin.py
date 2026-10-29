@@ -220,6 +220,49 @@ def rotated_box(centre, angle, size):
     return m.astype(bool)
 
 
+TAGLINE = ("DRONE AS FIRST RESPONDER", (267, 834, 1087, 877))   # text, x0 y0 x1 y1 of the caps
+
+
+def reletter_tagline(lab):
+    """Redraw the copper tagline: the traced D reads as an O and a radar line cuts the N."""
+    text, (x0, y0, x1, y1) = TAGLINE
+    lab = lab.copy()
+    pad = 6
+    lab[y0 - pad:y1 + pad, x0 - pad:x1 + pad] = FIELD
+    scale = 4
+    cap = y1 - y0
+    font = ImageFont.truetype(FONT, int(cap / 0.727 * scale))
+    # the render's face is narrower and more widely spaced than Inter: condense each glyph and
+    # spread the spare width between letters
+    condense = 0.82
+    glyphs = []
+    for ch in text:
+        if ch == " ":
+            glyphs.append(None)
+            continue
+        gi = Image.new("L", (int(cap * scale * 2), int(cap * scale * 1.6)), 0)
+        ImageDraw.Draw(gi).text((gi.width // 2, int(gi.height * 0.8)), ch, font=font, fill=255,
+                                anchor="ms")
+        gi = gi.crop(gi.getbbox())
+        glyphs.append(gi.resize((max(1, int(gi.width * condense)), gi.height), Image.LANCZOS))
+    space = font.getlength(" ") * condense
+    ink_w = sum(gi.width if gi else space for gi in glyphs)
+    gap = ((x1 - x0) * scale - ink_w) / (len(text) - 1)
+    g = Image.new("L", ((x1 - x0) * scale + 50, cap * scale + 50), 0)
+    x = 0.0
+    for gi in glyphs:
+        if gi is None:
+            x += space + gap
+            continue
+        g.paste(gi, (int(x), cap * scale - gi.height + 10))
+        x += gi.width + gap
+    g = g.crop(g.getbbox()).resize(((x1 - x0) * scale, cap * scale), Image.LANCZOS)
+    ink = np.array(g.resize((x1 - x0, cap), Image.LANCZOS)) > 110
+    region = lab[y0:y1, x0:x1]
+    region[ink] = COPPER
+    return lab
+
+
 def reletter_numbers(lab):
     lab = lab.copy()
     scale = 4
@@ -283,6 +326,10 @@ def label_side(name, args):
     """Classified, cleaned label map for one face (unmirrored, as seen)."""
     mm_px = 2 * R_PX / args.size                            # raster pixels per mm
     min_px = args.min_feature * mm_px
+    if name == "side_b_dfrx":
+        # clean line-art face: its radar rings fade in places in the render, and processing at a
+        # 0.38 mm line bridges those stretches; finer settings only turn the rings into dashes
+        min_px = max(min_px, 0.38 * mm_px)
     src = rectify(name)
     lab = classify(src)
 
@@ -292,34 +339,44 @@ def label_side(name, args):
     for cls in (SILVER, COPPER, GREEN, FIELD):
         lab = drop_specks(lab, cls, min_px ** 2, None)
 
-    # recover the dark outlines between facets: the render shades them as narrow grooves that
-    # colour thresholds miss, so find narrow dark features with a black-top-hat filter
-    grey = cv2.cvtColor(cv2.bilateralFilter(src, 7, 30, 5), cv2.COLOR_RGB2GRAY)
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    lines = (cv2.morphologyEx(grey, cv2.MORPH_BLACKHAT, k) > 30) & (grey < 130)
-    n, cc, st, _ = cv2.connectedComponentsWithStats(lines.astype(np.uint8), connectivity=8)
-    lines &= np.isin(cc, np.where(st[:, cv2.CC_STAT_AREA] >= 3 * min_px ** 2)[0][1:])
-    lab[lines & np.isin(lab, (SILVER, GUNMETAL, COPPER))] = FIELD
+    if name == "side_a_eagle":
+        # the eagle's faceted feathers need outline and second-metal recovery; the dFRX face is
+        # clean line-work that these filters would break up
+        # recover the dark outlines between facets: the render shades them as narrow grooves that
+        # colour thresholds miss, so find narrow dark features with a black-top-hat filter
+        grey = cv2.cvtColor(cv2.bilateralFilter(src, 7, 30, 5), cv2.COLOR_RGB2GRAY)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        lines = (cv2.morphologyEx(grey, cv2.MORPH_BLACKHAT, k) > 30) & (grey < 130)
+        n, cc, st, _ = cv2.connectedComponentsWithStats(lines.astype(np.uint8), connectivity=8)
+        lines &= np.isin(cc, np.where(st[:, cv2.CC_STAT_AREA] >= 3 * min_px ** 2)[0][1:])
+        lab[lines & np.isin(lab, (SILVER, GUNMETAL, COPPER))] = FIELD
 
-    # dark "gunmetal" feathers are only ~15 grey levels above the background, so find them as
-    # metal (heavily smoothed brightness) that is neither silver, copper, green nor an outline
-    v = cv2.cvtColor(src, cv2.COLOR_RGB2HSV)[..., 2].astype(np.float32)
-    metal = cv2.GaussianBlur(v, (0, 0), 4) > 64
-    gm = metal & np.isin(lab, (FIELD, GUNMETAL)) & ~lines
-    gm = cv2.morphologyEx(gm.astype(np.uint8), cv2.MORPH_OPEN,
-                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))).astype(bool)
-    n, cc, st, _ = cv2.connectedComponentsWithStats(gm.astype(np.uint8), connectivity=4)
-    gm = np.isin(cc, np.where(st[:, cv2.CC_STAT_AREA] >= (1.0 * mm_px) ** 2)[0][1:])
-    lab[lab == GUNMETAL] = FIELD
-    if args.gunmetal == "silver":
-        lab[gm] = SILVER
+        # dark "gunmetal" feathers are only ~15 grey levels above the background, so find them as
+        # metal (heavily smoothed brightness) that is neither silver, copper, green nor an outline
+        v = cv2.cvtColor(src, cv2.COLOR_RGB2HSV)[..., 2].astype(np.float32)
+        metal = cv2.GaussianBlur(v, (0, 0), 4) > 64
+        gm = metal & np.isin(lab, (FIELD, GUNMETAL)) & ~lines
+        gm = cv2.morphologyEx(gm.astype(np.uint8), cv2.MORPH_OPEN,
+                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))).astype(bool)
+        n, cc, st, _ = cv2.connectedComponentsWithStats(gm.astype(np.uint8), connectivity=4)
+        gm = np.isin(cc, np.where(st[:, cv2.CC_STAT_AREA] >= (1.0 * mm_px) ** 2)[0][1:])
+        lab[lab == GUNMETAL] = FIELD
+        if args.gunmetal == "silver":
+            lab[gm] = SILVER
+        else:
+            # a flat face cannot show a second metal tone: print the feather dark with a silver
+            # edge, as the render's bevel highlight reads
+            ring_px = max(min_px, 0.3 * mm_px)
+            core = cv2.erode(gm.astype(np.uint8), cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (int(2 * ring_px) | 1, int(2 * ring_px) | 1))).astype(bool)
+            lab[gm & ~core] = SILVER
+
     else:
-        # a flat face cannot show a second metal tone: print the feather dark with a silver
-        # edge, as the render's bevel highlight reads
-        ring_px = max(min_px, 0.3 * mm_px)
-        core = cv2.erode(gm.astype(np.uint8), cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (int(2 * ring_px) | 1, int(2 * ring_px) | 1))).astype(bool)
-        lab[gm & ~core] = SILVER
+        n, cc, st, _ = cv2.connectedComponentsWithStats((lab == GUNMETAL).astype(np.uint8),
+                                                        connectivity=4)
+        big = np.isin(cc, np.where(st[:, cv2.CC_STAT_AREA] >= (1.2 * mm_px) ** 2)[0][1:])
+        lab[(lab == GUNMETAL) & big] = SILVER
+        lab[lab == GUNMETAL] = FIELD
 
     # widen hairlines to the printable minimum: isolated light strokes first, then the dark
     # outlines between facets (dark wins, so facets stay separated)
@@ -342,6 +399,7 @@ def label_side(name, args):
         text[815:900, :] = True                             # DRONE AS FIRST RESPONDER
         lab[(lab == COPPER) & ~text] = SILVER
         lab = reletter_numbers(lab)
+        lab = reletter_tagline(lab)
 
     # geometric rim + clean groove inside it, clip to hexagon
     rim_px = args.rim * mm_px
